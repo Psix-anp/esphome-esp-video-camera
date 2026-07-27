@@ -1,0 +1,56 @@
+# NOTICE — origin, authorship and licensing of this repository
+
+This repository contains an ESPHome external component, `esp_video_camera`.
+It is a derivative work of ESPHome and is therefore distributed under the
+ESPHome License (see `LICENSE`), which applies the same split ESPHome itself
+uses:
+
+  * C++/runtime sources (`.c`, `.cpp`, `.h`, `.hpp`, `.tcc`, `.ino`) — GPLv3
+  * Python sources and everything else — MIT
+
+Concretely, in this repository:
+
+  * `components/esp_video_camera/esp_video_camera.cpp`
+    `components/esp_video_camera/esp_video_camera.h`
+    `components/esp_video_camera/i2c_helper.h`                        → GPLv3
+  * `components/esp_video_camera/__init__.py`
+    `components/esp_video_camera/cfg/sc202cs.json`
+    `README.md`, `CHANGELOG.md` and the rest of the repository        → MIT
+
+## Attribution
+
+* Copyright (c) 2019 ESPHome — the component derives from and links against the
+  ESPHome runtime (`esphome/components/camera`, `esphome/components/i2c`,
+  `esphome/core`) and follows ESPHome's component conventions.
+
+* Copyright (c) 2026 youkorr (https://github.com/youkorr) — original author of
+  the `esp_video_camera` component, submitted to ESPHome as pull request
+  https://github.com/esphome/esphome/pull/16944 ("[esp_video_camera] Add
+  ESP32-P4 esp_video (V4L2) camera platform"), which is itself a port of
+  https://github.com/youkorr/esphome_esp-video. That pull request has not been
+  merged into ESPHome. All files in `components/esp_video_camera/` originate
+  from it.
+
+* Copyright (c) 2026 Psix-anp (https://github.com/Psix-anp) — modifications
+  described in `CHANGELOG.md` and in the "Fixes on top of the original PR"
+  section of `README.md`. Changes are confined to `esp_video_camera.cpp` and
+  `esp_video_camera.h`; `__init__.py`, `i2c_helper.h` and `cfg/sc202cs.json` are
+  byte-identical to the pull request, apart from source comments in the C++
+  files that were translated to English for publication.
+
+  As required by GPLv3 §5(a): these files have been modified relative to the
+  original pull request. The modified C++ sources carry `// FORK:` comments at
+  every changed site, dated 2026-07-25.
+
+## Third-party components pulled at build time
+
+The component pulls Espressif sources through the ESP-IDF component manager at
+build time (`espressif/esp_video`, `esp_cam_sensor`, `esp_ipa`, `esp_sccb_intf`,
+`esp_h264`, optionally `usb_host_uvc`). None of them are vendored here; they
+carry their own licenses and are fetched from https://components.espressif.com/.
+As shipped in the versions this component pins (checked 2026-07): `esp_video`
+and `esp_ipa` are under the ESPRESSIF MIT License; `esp_cam_sensor`,
+`esp_sccb_intf`, `esp_h264` and `usb_host_uvc` are under Apache-2.0.
+
+`components/esp_video_camera/cfg/sc202cs.json` is an IPA (image tuning)
+configuration file taken from the original pull request.
