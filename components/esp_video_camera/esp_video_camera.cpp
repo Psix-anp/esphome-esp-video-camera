@@ -797,11 +797,12 @@ bool ESPVideoCamera::start_jpeg_pipeline_() {
     return false;
   }
 
-  struct v4l2_control ctrl;
-  memset(&ctrl, 0, sizeof(ctrl));
-  ctrl.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
-  ctrl.value = this->jpeg_quality_;
-  ioctl(this->jpeg_fd_, VIDIOC_S_CTRL, &ctrl);
+  // FORK: the static jpeg_quality: option used to be written with the legacy
+  // VIDIOC_S_CTRL, which esp_video 2.2.0 does not implement (EINVAL) — the option
+  // silently did nothing and the encoder kept its default quality. Send it through
+  // the same extended-control helper the runtime controls use. Not fatal: on
+  // failure v4l2_set_ext_ctrl() logs a warning and encoding continues.
+  v4l2_set_ext_ctrl(this->jpeg_fd_, V4L2_CID_JPEG_COMPRESSION_QUALITY, this->jpeg_quality_, "jpeg_quality");
 
   struct v4l2_requestbuffers req;
   memset(&req, 0, sizeof(req));

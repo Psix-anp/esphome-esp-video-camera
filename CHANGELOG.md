@@ -35,12 +35,12 @@ and `cfg/sc202cs.json` are unchanged from the pull request.
   dequeued OUTPUT first, which never starts the encode and blocks on
   `ready_sem` forever — the actual root cause of the watchdog hang. Order is now
   `DQBUF(CAPTURE)` (starts and awaits the encode), then `DQBUF(OUTPUT)`.
-* **Runtime control writes used the unsupported `VIDIOC_S_CTRL`.** `esp_video`
+* **Control writes used the unsupported `VIDIOC_S_CTRL`.** `esp_video`
   implements only the extended-control interface; the legacy ioctl returns
-  `EINVAL`. Control writes now use `VIDIOC_S_EXT_CTRLS` with a properly filled
-  `v4l2_ext_controls`, and log their result. (The inherited `VIDIOC_S_CTRL` call
-  for the static `jpeg_quality:` option is left as-is and remains ineffective —
-  see README.)
+  `EINVAL`, which is why the static `jpeg_quality:` option never reached the
+  encoder. Every control write — the static option and the runtime controls
+  alike — now uses `VIDIOC_S_EXT_CTRLS` with a properly filled
+  `v4l2_ext_controls`, and logs its result.
 * **Black snapshots right after a start.** The AE/IPA loop needs about 10 frames
   to converge, so the first frame off a freshly started pipeline was essentially
   black. The first `WARMUP_FRAMES = 10` sensor frames (counted before the

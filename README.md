@@ -82,21 +82,15 @@ by then the encoder is done with it.
 ### 4. Runtime controls go through `VIDIOC_S_EXT_CTRLS`, never `VIDIOC_S_CTRL`
 
 `esp_video`'s ioctl table implements only the extended-control interface. The
-legacy `VIDIOC_S_CTRL` returns `EINVAL`. A consequence worth knowing: the
-`jpeg_quality:` option from the original PR is **silently never applied** — it is
-written once with `VIDIOC_S_CTRL` in `start_jpeg_pipeline_()` and the return
-value is not checked.
+legacy `VIDIOC_S_CTRL` returns `EINVAL`. That is why the `jpeg_quality:` option
+from the original PR **never took effect**: it is written once with
+`VIDIOC_S_CTRL` in `start_jpeg_pipeline_()` and the return value is not checked,
+so the encoder silently kept its default quality.
 
-Fix: runtime control writes go through `VIDIOC_S_EXT_CTRLS` with a properly
-filled `v4l2_ext_controls` (`v4l2_set_ext_ctrl()`), and the result is logged.
-This is what made the runtime controls below possible.
-
-> The inherited `VIDIOC_S_CTRL` call for the static `jpeg_quality:` option is
-> still in place and still ineffective; it has been left alone deliberately so
-> this fork stays a minimal, hardware-verified delta. Use
-> `set_runtime_jpeg_quality()` to actually change the encoder quality — or
-> replace that one call with `v4l2_set_ext_ctrl()`, which should work but has
-> not been tested here.
+Fix: every control write — the static `jpeg_quality:` option and the runtime
+controls alike — goes through `VIDIOC_S_EXT_CTRLS` with a properly filled
+`v4l2_ext_controls` (`v4l2_set_ext_ctrl()`), and the result is logged. This is
+also what made the runtime controls below possible.
 
 There is also a one-shot enumeration of the sensor/ISP controls
 (`VIDIOC_QUERY_EXT_CTRL` with `V4L2_CTRL_FLAG_NEXT_CTRL`) logged on the first
@@ -392,10 +386,10 @@ Verified working: sensor detected over SCCB, IPA tuning loaded, ISP streaming
   — see "Sensor modes".
 * **Only three MIPI sensors are auto-detected** (SC202CS, OV5647, SC2336); that
   list is hardcoded in `__init__.py`.
-* **The static `jpeg_quality:` YAML option has no effect** (legacy
-  `VIDIOC_S_CTRL`, see fix 4) — use `set_runtime_jpeg_quality()`. Either way it
-  only applies to the hardware encoder on the `device: jpeg` path, not to a UVC
-  source that hands you pre-encoded MJPEG.
+* **`jpeg_quality:` only applies to the hardware encoder** on the `device: jpeg`
+  path, not to a UVC source that hands you pre-encoded MJPEG. (It reaches the
+  encoder since the extended-control fix — see fix 4; `set_runtime_jpeg_quality()`
+  overrides it at runtime.)
 * The USB-UVC path is inherited from the original PR and is **not tested here**.
 
 ## License
