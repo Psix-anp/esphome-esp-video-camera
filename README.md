@@ -164,7 +164,7 @@ Note that the first build with this toolchain downloads the full IDF toolchain
 ```yaml
 external_components:
   # This component.
-  - source: github://<owner>/esp-video-camera
+  - source: github://Psix-anp/esphome-esp-video-camera
     components: [esp_video_camera]
   # The base `camera` platform is not in ESPHome yet either — it comes from the
   # same (still unmerged) pull request.
