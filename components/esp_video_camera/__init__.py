@@ -127,18 +127,37 @@ async def to_code(config):
     cg.add(var.set_jpeg_quality(config[CONF_JPEG_QUALITY]))
     cg.add(var.set_max_framerate(config[CONF_MAX_FRAMERATE]))
 
-    # Managed Espressif components (no vendored sources). Espressif's esp_video
-    # (V4L2) framework transitively pulls the rest of the camera stack at
-    # compatible versions: esp_cam_sensor (MIPI sensor drivers), esp_sccb_intf
-    # (camera I2C/SCCB), esp_ipa (ISP/IPA tuning) and, on the ESP32-P4, esp_h264.
-    # Versions verified against espressif/esp-video-components. esp_video 2.2.0
-    # requires ESP-IDF >= 5.4.
-    add_idf_component(name="espressif/esp_video", ref="2.2.0")
+    # Use the immutable official follow-up to esp_video 2.3.0. The registry
+    # release pins esp_h264 to 1.3.0 exactly; this commit widens that manifest
+    # edge to 1.3.* so esp_video can coexist with another component selecting a
+    # newer compatible 1.3.x codec.
+    jpeg_enabled = config[CONF_DEVICE] in ("jpeg", "/dev/video10")
+    raw_csi_enabled = config[CONF_DEVICE] in ("csi", "/dev/video0")
+    add_idf_component(
+        name="espressif/esp_video",
+        repo="https://github.com/espressif/esp-video-components.git",
+        ref="50d258a34938014b5f43277573880d96bd8ed669",
+        path="esp_video",
+    )
+    if not raw_csi_enabled:
+        # esp_video declares esp_h264 for every ESP32-P4 in its manifest, while
+        # its source and CMake dependency are correctly gated by the disabled
+        # H.264 Kconfig symbol. Satisfy that inactive manifest edge for direct
+        # JPEG/MJPEG devices without downloading or compiling the codec. A raw
+        # CSI source remains available to separate encoder integrations.
+        add_extra_build_file(
+            "components/esp_h264/CMakeLists.txt",
+            Path(__file__).parent / "build_stubs" / "esp_h264" / "CMakeLists.txt",
+        )
+        add_extra_build_file(
+            "components/esp_h264/idf_component.yml",
+            Path(__file__).parent / "build_stubs" / "esp_h264" / "idf_component.yml",
+        )
     if config[CONF_ENABLE_UVC]:
-        # USB-UVC host driver, aligned with esp_video 2.2.0's own dependency.
+        # USB-UVC host driver, aligned with esp_video 2.3.0's own dependency.
         add_idf_component(name="espressif/usb_host_uvc", ref="2.5.*")
 
-    # Pipeline features. Kconfig keys verified against esp_video 2.2.0.
+    # Pipeline features. JPEG encoder symbols were renamed in esp_video 2.3.0.
     # ENABLE_ISP_PIPELINE_CONTROLLER (default n) is what pulls in esp_ipa and
     # runs the AWB/AE/CCM/gamma automation that applies the sensor IPA JSON
     # tuning; without it the MIPI image is unprocessed (washed-out / green cast).
@@ -147,15 +166,18 @@ async def to_code(config):
         "CONFIG_ESP_VIDEO_ENABLE_ISP",
         "CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE",
         "CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER",
-        "CONFIG_ESP_VIDEO_ENABLE_JPEG_VIDEO_DEVICE",
-        "CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE",
     ):
         add_idf_sdkconfig_option(opt, True)
+    if jpeg_enabled:
+        add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_JPEG_ENC_VIDEO_DEVICE", True)
+        add_idf_sdkconfig_option(
+            "CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_ENC_VIDEO_DEVICE", True
+        )
     if config[CONF_ENABLE_UVC]:
         add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE", True)
 
     # Auto-detect the MIPI-CSI sensors shipped with espressif/esp_cam_sensor over
-    # the shared I2C bus. Kconfig keys verified against esp_cam_sensor 2.2.0.
+    # the shared I2C bus. Kconfig keys verified against esp_cam_sensor 2.3.x.
     for sensor in ("SC202CS", "OV5647", "SC2336"):
         add_idf_sdkconfig_option(f"CONFIG_CAMERA_{sensor}", True)
         add_idf_sdkconfig_option(
