@@ -18,7 +18,13 @@ from esphome.components.esp32 import (
     add_idf_sdkconfig_option,
 )
 import esphome.config_validation as cv
-from esphome.const import CONF_DEVICE, CONF_I2C_ID, CONF_ID, CONF_RESOLUTION
+from esphome.const import (
+    CONF_DEVICE,
+    CONF_I2C_ID,
+    CONF_ID,
+    CONF_RESOLUTION,
+    CONF_ROTATION,
+)
 from esphome.core import CORE
 from esphome.core.entity_helpers import setup_entity
 
@@ -27,12 +33,8 @@ DEPENDENCIES = ["esp32", "i2c"]
 AUTO_LOAD = ["camera"]
 
 esp_video_camera_ns = cg.esphome_ns.namespace("esp_video_camera")
-Camera = cg.esphome_ns.namespace("camera").class_(
-    "Camera", cg.EntityBase, cg.Component
-)
-ESPVideoCamera = esp_video_camera_ns.class_(
-    "ESPVideoCamera", Camera
-)
+Camera = cg.esphome_ns.namespace("camera").class_("Camera", cg.EntityBase, cg.Component)
+ESPVideoCamera = esp_video_camera_ns.class_("ESPVideoCamera", Camera)
 
 CONF_JPEG_QUALITY = "jpeg_quality"
 CONF_MAX_FRAMERATE = "max_framerate"
@@ -42,6 +44,7 @@ CONF_ENABLE_XCLK = "enable_xclk"
 CONF_ENABLE_UVC = "enable_uvc"
 
 _RESOLUTION_ALIASES = ("QVGA", "VGA", "480P", "720P", "1080P")
+_ROTATIONS = {0: 0, 90: 90, 180: 180, 270: 270}
 
 
 def _validate_resolution(value):
@@ -74,13 +77,31 @@ def _validate_device(value):
     )
 
 
+def _validate_rotation(value):
+    value = cv.string(value).removesuffix("°")
+    return cv.enum(_ROTATIONS, int=True)(value)
+
+
+def _validate_config(config):
+    if config[CONF_ROTATION] != 0 and config[CONF_DEVICE] not in (
+        "jpeg",
+        "/dev/video10",
+    ):
+        raise cv.Invalid(
+            "rotation is supported only by the MIPI-CSI hardware JPEG path "
+            "(device: jpeg). An already-compressed MJPEG/UVC frame cannot be "
+            "rotated without decoding and re-encoding it."
+        )
+    return config
+
+
 def _xclk_pin(value):
     if isinstance(value, str) and value.upper() in ("-1", "NO_CLOCK"):
         return -1
     return cv.int_range(min=-1, max=48)(value)
 
 
-CONFIG_SCHEMA = (
+CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(ESPVideoCamera),
@@ -91,6 +112,7 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_MAX_FRAMERATE, default=10): cv.float_range(
                 min=0.1, max=60.0
             ),
+            cv.Optional(CONF_ROTATION, default=0): _validate_rotation,
             cv.Optional(CONF_XCLK_PIN, default=36): _xclk_pin,
             cv.Optional(CONF_XCLK_FREQUENCY, default=24000000): cv.int_range(
                 min=1000000, max=40000000
@@ -100,7 +122,8 @@ CONFIG_SCHEMA = (
         }
     )
     .extend(cv.ENTITY_BASE_SCHEMA)
-    .extend(cv.COMPONENT_SCHEMA)
+    .extend(cv.COMPONENT_SCHEMA),
+    _validate_config,
 )
 
 
@@ -129,6 +152,7 @@ async def to_code(config):
     cg.add(var.set_resolution(config[CONF_RESOLUTION]))
     cg.add(var.set_jpeg_quality(config[CONF_JPEG_QUALITY]))
     cg.add(var.set_max_framerate(config[CONF_MAX_FRAMERATE]))
+    cg.add(var.set_rotation(config[CONF_ROTATION]))
 
     # Use the immutable official follow-up to esp_video 2.3.0. The registry
     # release pins esp_h264 to 1.3.0 exactly; this commit widens that manifest

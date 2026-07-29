@@ -9,6 +9,7 @@
 #include "esphome/components/i2c/i2c.h"
 
 #include "driver/gpio.h"
+#include "driver/ppa.h"
 
 #include <atomic>
 #include <memory>
@@ -121,6 +122,7 @@ class ESPVideoCamera : public camera::Camera {
   void set_device(const std::string &device) { this->device_ = device; }
   void set_resolution(const std::string &resolution) { this->resolution_ = resolution; }
   void set_jpeg_quality(int quality) { this->jpeg_quality_ = quality; }
+  void set_rotation(uint16_t rotation) { this->rotation_degrees_ = rotation; }
   void set_max_framerate(float fps) {
     this->max_framerate_ = fps;
     this->min_interval_ms_ = (fps > 0.0f) ? (uint32_t) (1000.0f / fps) : 0;
@@ -158,6 +160,8 @@ class ESPVideoCamera : public camera::Camera {
   void stop_stream(camera::CameraRequester requester) override;
 
   // FORK: optional synchronous taps share the component-owned V4L2 queues.
+  // A stop call prevents future delivery but is not a barrier for a callback
+  // already running on the capture task.
   bool register_raw_frame_consumer(RawVideoFrameConsumer *consumer);
   bool start_raw_frame_consumer(RawVideoFrameConsumer *consumer);
   void stop_raw_frame_consumer(RawVideoFrameConsumer *consumer);
@@ -192,6 +196,8 @@ class ESPVideoCamera : public camera::Camera {
   void apply_runtime_ctrls_();
   bool configure_capture_format_(uint32_t pixelformat);
   bool setup_capture_buffers_();
+  bool setup_transform_();
+  bool release_transform_();
   // Hardware-JPEG path: capture RGB565 (sensor/ISP) -> JPEG M2M encoder.
   bool start_jpeg_pipeline_();
   void loop_jpeg_pipeline_();
@@ -219,6 +225,7 @@ class ESPVideoCamera : public camera::Camera {
   bool is_raw_csi_{false};
   std::string resolution_{"auto"};
   int jpeg_quality_{10};
+  uint16_t rotation_degrees_{0};
   float max_framerate_{10.0f};
   uint32_t min_interval_ms_{100};
   uint32_t last_frame_ms_{0};
@@ -249,6 +256,8 @@ class ESPVideoCamera : public camera::Camera {
   uint32_t capture_width_{0};
   uint32_t capture_height_{0};
   uint32_t capture_stride_bytes_{0};
+  uint32_t jpeg_width_{0};
+  uint32_t jpeg_height_{0};
   static constexpr int MAX_BUFFERS = 3;
   struct MappedBuffer {
     void *start{nullptr};
@@ -257,6 +266,18 @@ class ESPVideoCamera : public camera::Camera {
   MappedBuffer capture_buffers_[MAX_BUFFERS];
   int num_capture_buffers_{0};
   MappedBuffer jpeg_out_buffer_;
+
+  // FORK: optional producer-side PPA transform for the hardware JPEG path.
+  // One SRM transaction rotates and, when the sensor coerces a requested
+  // resolution upward, downscales the RGB565 frame before JPEG encoding.
+  ppa_client_handle_t ppa_srm_{nullptr};
+  bool ppa_transform_required_{false};
+  float ppa_scale_x_{1.0f};
+  float ppa_scale_y_{1.0f};
+  uint8_t *transformed_rgb565_{nullptr};
+  size_t transformed_rgb565_bytes_{0};
+  size_t transformed_rgb565_alloc_size_{0};
+  size_t transformed_rgb565_capacity_{0};
 
   // FORK: capture task + frame hand-off to loop().
   TaskHandle_t capture_task_{nullptr};

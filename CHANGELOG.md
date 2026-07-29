@@ -12,6 +12,10 @@ to this repository, not to the upstream pull request.
   Assistant camera requesters without opening the sensor a second time.
 * `device: csi` now operates as a raw-consumer-only pipeline and bypasses the
   hardware JPEG encoder.
+* Hardware PPA rotation for the MIPI-CSI JPEG path, configured as 0, 90, 180
+  or 270 degrees clockwise.
+* Hardware downscaling before JPEG encoding when a requested resolution is
+  coerced upward by the sensor and is exactly representable at 1/16 precision.
 
 ### Changed
 
@@ -21,6 +25,12 @@ to this repository, not to the upstream pull request.
 * Keep direct JPEG/MJPEG builds free of the inactive `esp_h264` dependency
   through an empty local component stub; raw CSI integrations still resolve the
   real managed codec.
+
+### Fixed
+
+* Treat an explicit `/dev/video0` source as the same raw CSI mode as
+  `device: csi`, matching the Python configuration and build-time dependency
+  selection.
 
 ## v0.1.0 — 2026-07-27
 
