@@ -21,6 +21,45 @@
 
 namespace esphome::esp_video_camera {
 
+/// FORK: A borrowed native RGB565_LE frame produced by the camera's ISP path.
+///
+/// ESPVideoCamera owns the storage. It remains valid only for the synchronous
+/// consume_raw_video_frame() call and must not be retained by the consumer.
+/// Consumers that need asynchronous processing must copy the payload before
+/// returning.
+struct RawVideoFrame {
+  const uint8_t *data{nullptr};
+  size_t size{0};
+  uint16_t width{0};
+  uint16_t height{0};
+  uint16_t stride_bytes{0};
+  uint32_t timestamp_90khz{0};
+  uint16_t rotation_degrees{0};
+};
+
+class RawVideoFrameConsumer {
+ public:
+  virtual ~RawVideoFrameConsumer() = default;
+  virtual void consume_raw_video_frame(const RawVideoFrame &frame) = 0;
+};
+
+/// A borrowed JPEG access unit produced by the camera hardware.
+///
+/// ESPVideoCamera retains the V4L2 buffer. The payload is valid only for the
+/// synchronous consume_jpeg_frame() call. Consumers that retain or queue a
+/// frame must copy it before returning.
+struct JpegFrame {
+  const uint8_t *data{nullptr};
+  size_t size{0};
+  uint32_t timestamp_90khz{0};
+};
+
+class JpegFrameConsumer {
+ public:
+  virtual ~JpegFrameConsumer() = default;
+  virtual void consume_jpeg_frame(const JpegFrame &frame) = 0;
+};
+
 /// An owned JPEG/MJPEG frame (copied into PSRAM) shared with the API.
 ///
 /// The data is JPEG-encoded (required by the Home Assistant camera API). It is
@@ -118,11 +157,20 @@ class ESPVideoCamera : public camera::Camera {
   void start_stream(camera::CameraRequester requester) override;
   void stop_stream(camera::CameraRequester requester) override;
 
+  // FORK: optional synchronous taps share the component-owned V4L2 queues.
+  bool register_raw_frame_consumer(RawVideoFrameConsumer *consumer);
+  bool start_raw_frame_consumer(RawVideoFrameConsumer *consumer);
+  void stop_raw_frame_consumer(RawVideoFrameConsumer *consumer);
+  bool register_jpeg_frame_consumer(JpegFrameConsumer *consumer);
+  bool start_jpeg_frame_consumer(JpegFrameConsumer *consumer);
+  void stop_jpeg_frame_consumer(JpegFrameConsumer *consumer);
+
  protected:
   bool init_pipeline_();
   bool start_capture_();
   void stop_capture_();
   void update_capture_state_();
+  bool has_consumers_() const;
 
   // FORK: capture moved out of loop() into a dedicated FreeRTOS task. The
   // blocking DQBUF ioctls stalled loopTask for >5 s → task_wdt → reboot
@@ -147,6 +195,11 @@ class ESPVideoCamera : public camera::Camera {
   // Hardware-JPEG path: capture RGB565 (sensor/ISP) -> JPEG M2M encoder.
   bool start_jpeg_pipeline_();
   void loop_jpeg_pipeline_();
+  void deliver_raw_frame_(const uint8_t *data, size_t size, uint16_t width,
+                          uint16_t height, uint16_t stride_bytes,
+                          uint32_t timestamp_90khz);
+  void deliver_jpeg_frame_(const uint8_t *data, size_t size,
+                           uint32_t timestamp_90khz);
   // Direct path: a source that already delivers JPEG/MJPEG (USB-UVC / device).
   bool start_direct_capture_();
   void loop_direct_capture_();
@@ -163,6 +216,7 @@ class ESPVideoCamera : public camera::Camera {
   std::string device_{"jpeg"};
   std::string resolved_device_;
   bool is_hw_jpeg_{false};
+  bool is_raw_csi_{false};
   std::string resolution_{"auto"};
   int jpeg_quality_{10};
   float max_framerate_{10.0f};
@@ -172,8 +226,13 @@ class ESPVideoCamera : public camera::Camera {
   // Consumers (bit masks indexed by camera::CameraRequester)
   std::vector<camera::CameraListener *> listeners_;
   std::shared_ptr<ESPVideoCameraImage> current_image_;
-  uint8_t stream_requesters_{0};
-  uint8_t single_requesters_{0};
+  std::atomic<uint8_t> stream_requesters_{0};
+  std::atomic<uint8_t> single_requesters_{0};
+  // FORK: cross-task borrowed-frame consumers.
+  std::atomic<RawVideoFrameConsumer *> raw_frame_consumer_{nullptr};
+  std::atomic<bool> raw_frame_consumer_active_{false};
+  std::atomic<JpegFrameConsumer *> jpeg_frame_consumer_{nullptr};
+  std::atomic<bool> jpeg_frame_consumer_active_{false};
 
   // V4L2 state.
   //
@@ -189,6 +248,7 @@ class ESPVideoCamera : public camera::Camera {
   bool streaming_{false};
   uint32_t capture_width_{0};
   uint32_t capture_height_{0};
+  uint32_t capture_stride_bytes_{0};
   static constexpr int MAX_BUFFERS = 3;
   struct MappedBuffer {
     void *start{nullptr};

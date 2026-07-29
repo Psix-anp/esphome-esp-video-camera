@@ -341,6 +341,31 @@ in your build directory for the exact symbols.
 
 ---
 
+## Borrowed frame consumers
+
+Native media components can register one raw-frame consumer and one JPEG-frame
+consumer without opening the sensor or V4L2 queues a second time.
+
+* `RawVideoFrameConsumer` receives RGB565 frames directly from the MIPI-CSI/ISP
+  queue, before hardware JPEG encoding.
+* `JpegFrameConsumer` receives the JPEG access unit produced by the hardware
+  encoder, or the MJPEG frame supplied by a direct UVC source.
+* `device: csi` is a raw-consumer-only mode. It does not publish images through
+  the ESPHome camera API because no JPEG frame is produced.
+
+Both callbacks execute synchronously on the capture task. Their data pointers
+are borrowed and valid **only for the duration of the callback**. A consumer
+must copy the payload before returning if it needs to retain or queue the frame,
+and should keep callback work bounded so the V4L2 buffer can be re-queued
+promptly.
+
+Registration and activation are separate: register a stable consumer object
+once, then use `start_raw_frame_consumer()` / `stop_raw_frame_consumer()` or
+their JPEG equivalents to control delivery. At most one consumer of each type
+can be registered.
+
+---
+
 ## Tested on
 
 * **Board:** Waveshare ESP32-P4-WIFI6-PoE-ETH
