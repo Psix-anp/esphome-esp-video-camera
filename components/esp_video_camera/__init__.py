@@ -27,8 +27,11 @@ DEPENDENCIES = ["esp32", "i2c"]
 AUTO_LOAD = ["camera"]
 
 esp_video_camera_ns = cg.esphome_ns.namespace("esp_video_camera")
+Camera = cg.esphome_ns.namespace("camera").class_(
+    "Camera", cg.EntityBase, cg.Component
+)
 ESPVideoCamera = esp_video_camera_ns.class_(
-    "ESPVideoCamera", cg.Component, cg.EntityBase
+    "ESPVideoCamera", Camera
 )
 
 CONF_JPEG_QUALITY = "jpeg_quality"
