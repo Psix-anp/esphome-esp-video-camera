@@ -200,6 +200,14 @@ async def to_code(config):
         add_idf_sdkconfig_option(
             "CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_ENC_VIDEO_DEVICE", True
         )
+
+    # ESPHome disables IDF runtime tag filtering by default. The prebuilt IPA
+    # libraries emit per-frame debug telemetry, so esp_log_level_set() would be
+    # a no-op without this lower-memory tag backend.
+    add_idf_sdkconfig_option("CONFIG_LOG_DYNAMIC_LEVEL_CONTROL", True)
+    add_idf_sdkconfig_option("CONFIG_LOG_TAG_LEVEL_IMPL_NONE", False)
+    add_idf_sdkconfig_option("CONFIG_LOG_TAG_LEVEL_IMPL_LINKED_LIST", True)
+
     if config[CONF_ENABLE_UVC]:
         add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE", True)
 

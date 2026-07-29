@@ -25,6 +25,15 @@ to this repository, not to the upstream pull request.
 * Keep direct JPEG/MJPEG builds free of the inactive `esp_h264` dependency
   through an empty local component stub; raw CSI integrations still resolve the
   real managed codec.
+* Capture now blocks on V4L2 frame events with a bounded driver timeout instead
+  of polling a non-blocking descriptor with a one-tick delay.
+* Hardware JPEG warmup discards the first two CSI buffers after `STREAMON`;
+  raw CSI retains a 250 ms deadline. Linger and recovery use one-shot ESPHome
+  timers.
+* `max_framerate` uses `VIDIOC_S_PARM` hardware frame skipping when supported,
+  with the existing software throttle retained as a fallback.
+* Per-frame ISP/IPA debug telemetry is clamped to warnings through ESP-IDF's
+  linked-list tag-level filter.
 
 ### Fixed
 
@@ -32,7 +41,15 @@ to this repository, not to the upstream pull request.
   `device: csi`, matching the Python configuration and build-time dependency
   selection.
 
-## v0.1.0 — 2026-07-27
+* Add bounded capture restart attempts after V4L2 failures.
+* Add clean capture-task and `esp_video` shutdown.
+* Keep prepared V4L2 buffers across idle linger cycles and resume them without
+  per-session allocation.
+* Preserve one-shot requester ownership when the pending-frame slot is
+  overwritten and make cross-task requester state atomic.
+* Stop reusing a raw USERPTR after the JPEG device has accepted ownership.
+
+## v0.1.0, 2026-07-27
 
 First published version. Baseline is the `esp_video_camera` component from
 [esphome/esphome#16944](https://github.com/esphome/esphome/pull/16944) by

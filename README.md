@@ -99,25 +99,26 @@ successful capture start, so you can see what your sensor actually supports:
 [esp_video_camera] sensor ctrl: 12 controls enumerated
 ```
 
-### 5. Warmup — the first 10 frames after a start are discarded
+### 5. Warmup: unstable startup frames are withheld
 
 The AE/IPA loop starts cold. With an event-driven use case (capture a snapshot
 when someone presses a button) the very first frame off a freshly started
 pipeline is essentially black.
 
-Fix: `WARMUP_FRAMES = 10` sensor frames are dequeued and dropped before anything
-is published. Warmup is counted in *sensor* frames, i.e. before the
-`max_framerate` throttle, so it costs ~220 ms at 45 fps rather than 10 × the
-throttle interval.
+The hardware JPEG path discards the first two CSI buffers after every
+`STREAMON`, matching Espressif's V4L2 examples. The raw CSI path retains a
+250 ms deadline because hardware frame skipping changes how often userspace
+receives a frame.
 
-### 6. Linger — the pipeline stays alive 5 s after the last request
+### 6. Linger: the pipeline stays alive 5 s after the last request
 
 Tearing the pipeline down the moment the last requester disappears means the
 next snapshot pays the warmup cost again. In practice events arrive in bursts.
 
-Fix: `LINGER_MS = 5000`. After the last request `loop()` waits 5 s before
-clearing `capture_wanted_`; the capture task then leaves its loop and stops the
-pipeline. A burst of events is served by an already warm camera.
+Fix: `LINGER_MS = 5000`. A one-shot ESPHome timeout clears capture intent after
+5 s; the capture task then stops the V4L2 queues while retaining the prepared
+descriptors and mapped buffers. A later request requeues the same buffers and
+restarts streaming without reallocating them or polling the main loop.
 
 ---
 
@@ -125,6 +126,7 @@ pipeline. A burst of events is served by an already warm camera.
 
 * ESP32-P4 with a MIPI-CSI sensor supported by `esp_cam_sensor`
   (auto-detected: SC202CS, OV5647, SC2336), or a USB-UVC camera.
+* External PSRAM for the JPEG handoff copy.
 * ESP-IDF **≥ 5.4** (required by `esp_video` 2.3.0).
 * **The `esp-idf` toolchain — this is mandatory**, see below.
 
@@ -204,7 +206,7 @@ esp_video_camera:
 | `resolution` | `auto` | `auto`, an alias (`QVGA`/`VGA`/`480P`/`720P`/`1080P`) or `WIDTHxHEIGHT`. Best-effort: the sensor must actually support the mode, see "Sensor modes". |
 | `jpeg_quality` | `10` | 1..63 (`V4L2_CID_JPEG_COMPRESSION_QUALITY`). |
 | `rotation` | `0` | `0`, `90`, `180` or `270` degrees clockwise. Hardware PPA; MIPI-CSI JPEG path only. |
-| `max_framerate` | `10` | Throttle for ESPHome camera API frames. Borrowed consumers receive the sensor frame rate. |
+| `max_framerate` | `10` | Programs V4L2 frame skipping when supported. If the source cannot apply it, ESPHome API frames use a software throttle while borrowed consumers retain the sensor frame rate. |
 | `enable_xclk` | `false` | Generate the sensor XCLK with LEDC before init. Not needed for modules with their own crystal. |
 | `xclk_pin` | `36` | Only used when `enable_xclk: true`. |
 | `xclk_frequency` | `24000000` | Only used when `enable_xclk: true`. |
@@ -235,7 +237,7 @@ issued from a foreign thread.
 | `set_runtime_vflip(bool)` | `V4L2_CID_VFLIP` | on/off |
 | `set_runtime_hflip(bool)` | `V4L2_CID_HFLIP` | on/off |
 | `set_runtime_jpeg_quality(int)` | `V4L2_CID_JPEG_COMPRESSION_QUALITY` | 1..63 |
-| `set_runtime_max_fps(float)` | publish throttle (no ioctl) | > 0 |
+| `set_runtime_max_fps(float)` | current-session publish throttle; V4L2 rate is reapplied on the next capture start | > 0 |
 
 Check the `sensor ctrl:` enumeration in the log (fix 4) to see which controls
 your sensor really implements. Exposure in particular may be partially

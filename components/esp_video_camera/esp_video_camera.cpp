@@ -10,7 +10,9 @@
 #include "esp_timer.h"
 
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
@@ -22,6 +24,7 @@
 extern "C" {
 #include "esp_video_init.h"
 #include "esp_video_device.h"
+#include "esp_video_ioctl.h"
 #include "linux/videodev2.h"
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
@@ -69,6 +72,19 @@ ppa_srm_rotation_angle_t ppa_rotation_for_clockwise(uint16_t rotation) {
 
 // FORK: setup has a bounded wait, but esp_video_init() itself is not
 // cancellable. Keep the task's complete argument graph alive if it times out.
+
+// esp_video 2.2.0 can emit ISP/IPA DEBUG telemetry for every frame regardless
+// of the application logger level. Keep faults visible without letting camera
+// tuning logs monopolize the serial/logger path.
+void clamp_isp_log_levels() {
+  esp_log_level_set("ISP", ESP_LOG_WARN);
+  esp_log_level_set("esp_ipa_adn", ESP_LOG_WARN);
+  esp_log_level_set("esp_ipa_aen", ESP_LOG_WARN);
+  esp_log_level_set("esp_ipa_ian", ESP_LOG_WARN);
+  esp_log_level_set("esp_ipa_acc", ESP_LOG_WARN);
+  esp_log_level_set("esp_ipa_af", ESP_LOG_WARN);
+}
+
 struct VideoInitParams {
   esp_video_init_config_t config{};
   esp_video_init_csi_config_t csi_config{};
@@ -270,15 +286,70 @@ void ESPVideoCamera::setup() {
   // priority 3, pinned to CPU0 (loopTask runs on CPU1, so capture does not
   // compete with the main loop for a core).
   this->frame_mutex_ = xSemaphoreCreateMutex();
-  if (this->frame_mutex_ == nullptr ||
+  this->capture_task_done_ =
+      xSemaphoreCreateBinaryStatic(&this->capture_task_done_storage_);
+  this->capture_task_running_.store(true, std::memory_order_release);
+  if (this->frame_mutex_ == nullptr || this->capture_task_done_ == nullptr ||
       xTaskCreatePinnedToCore(ESPVideoCamera::capture_task_trampoline, "esp_video_cap", 8192, this, 3,
                               &this->capture_task_, 0) != pdPASS) {
+    this->capture_task_running_.store(false, std::memory_order_release);
     ESP_LOGE(TAG, "Failed to create capture task");
     this->mark_failed();
     return;
   }
 
   ESP_LOGI(TAG, "Camera ready on %s (source: %s)", this->resolved_device_.c_str(), this->device_.c_str());
+  this->disable_loop();
+}
+
+void ESPVideoCamera::on_shutdown() {
+  this->cancel_timeout("capture_linger");
+  this->cancel_timeout("capture_retry");
+  this->capture_linger_armed_ = false;
+  this->capture_retry_armed_ = false;
+  this->stream_requesters_.store(0, std::memory_order_release);
+  this->single_requesters_.store(0, std::memory_order_release);
+  this->raw_frame_consumer_active_.store(false, std::memory_order_release);
+  this->jpeg_frame_consumer_active_.store(false, std::memory_order_release);
+  this->capture_wanted_.store(false, std::memory_order_release);
+  this->capture_task_running_.store(false, std::memory_order_release);
+
+  if (this->capture_task_ != nullptr) {
+    xTaskNotifyGive(this->capture_task_);
+    if (this->capture_task_done_ == nullptr ||
+        xSemaphoreTake(this->capture_task_done_,
+                       pdMS_TO_TICKS(CAPTURE_STOP_TIMEOUT_MS)) != pdTRUE) {
+      ESP_LOGE(TAG,
+               "Camera capture task did not stop before shutdown; "
+               "retaining esp_video resources");
+      return;
+    }
+    this->capture_task_ = nullptr;
+    if (this->pipeline_ready_) {
+      ESP_LOGE(TAG,
+               "Camera capture task stopped with esp_video resources retained");
+      return;
+    }
+  } else if (this->pipeline_ready_) {
+    const esp_err_t error = esp_video_deinit();
+    if (error != ESP_OK) {
+      ESP_LOGE(TAG, "esp_video shutdown failed: %s",
+               esp_err_to_name(error));
+      return;
+    }
+    this->pipeline_ready_ = false;
+  }
+  if (this->frame_mutex_ != nullptr &&
+      xSemaphoreTake(this->frame_mutex_, 0) == pdTRUE) {
+    if (this->pending_jpeg_ != nullptr) {
+      heap_caps_free(this->pending_jpeg_);
+      this->pending_jpeg_ = nullptr;
+      this->pending_jpeg_len_ = 0;
+      this->pending_requesters_ = 0;
+    }
+    xSemaphoreGive(this->frame_mutex_);
+  }
+  ESP_LOGI(TAG, "Camera pipeline stopped cleanly");
 }
 
 bool ESPVideoCamera::init_pipeline_() {
@@ -388,6 +459,7 @@ bool ESPVideoCamera::init_pipeline_() {
     ESP_LOGE(TAG, "esp_video_init() failed: %s", esp_err_to_name(init_result));
     return false;
   }
+  clamp_isp_log_levels();
   this->pipeline_ready_ = true;
   return true;
 }
@@ -400,29 +472,52 @@ bool ESPVideoCamera::init_pipeline_() {
 // hands it to the listeners (the API callbacks are not thread-safe, so they
 // belong here, on the main loop).
 void ESPVideoCamera::loop() {
+  // Consume the current wake-up first. A publication racing with this callback
+  // then remains armed for the next loop iteration.
+  this->disable_loop();
   uint8_t *data = nullptr;
   size_t len = 0;
-  if (this->pending_jpeg_ != nullptr && xSemaphoreTake(this->frame_mutex_, 0) == pdTRUE) {
-    data = this->pending_jpeg_;
-    len = this->pending_jpeg_len_;
-    this->pending_jpeg_ = nullptr;
-    this->pending_jpeg_len_ = 0;
+  uint8_t requesters = 0;
+  if (xSemaphoreTake(this->frame_mutex_, 0) == pdTRUE) {
+    if (this->pending_jpeg_ != nullptr) {
+      data = this->pending_jpeg_;
+      len = this->pending_jpeg_len_;
+      requesters = this->pending_requesters_;
+      this->pending_jpeg_ = nullptr;
+      this->pending_jpeg_len_ = 0;
+      this->pending_requesters_ = 0;
+    }
     xSemaphoreGive(this->frame_mutex_);
   }
   if (data != nullptr)
-    this->deliver_frame_owned_(data, len);
+    this->deliver_frame_owned_(data, len, requesters);
 
-  // No requests left: do not tear the pipeline down immediately, wait LINGER_MS
-  // (keeps AE warm for bursts of events). The task leaves its capture loop on
-  // its own and stops the pipeline.
-  if (!this->has_consumers_()) {
-    uint32_t now = millis();
-    if (this->idle_since_ms_ == 0)
-      this->idle_since_ms_ = now;
-    if (now - this->idle_since_ms_ > LINGER_MS)
-      this->capture_wanted_.store(false);
-  } else {
-    this->idle_since_ms_ = 0;
+  if (this->capture_retry_requested_.exchange(
+          false, std::memory_order_acq_rel) &&
+      this->has_consumers_() && !this->capture_retry_armed_) {
+    this->capture_retry_armed_ = true;
+    this->set_timeout("capture_retry", CAPTURE_RETRY_MS, [this]() {
+      this->capture_retry_armed_ = false;
+      if (!this->has_consumers_())
+        return;
+      this->capture_wanted_.store(true, std::memory_order_release);
+      if (this->capture_task_ != nullptr)
+        xTaskNotifyGive(this->capture_task_);
+    });
+  }
+
+  if (this->has_consumers_()) {
+    if (this->capture_linger_armed_) {
+      this->cancel_timeout("capture_linger");
+      this->capture_linger_armed_ = false;
+    }
+  } else if (!this->capture_linger_armed_) {
+    this->capture_linger_armed_ = true;
+    this->set_timeout("capture_linger", LINGER_MS, [this]() {
+      this->capture_linger_armed_ = false;
+      if (!this->has_consumers_())
+        this->capture_wanted_.store(false, std::memory_order_release);
+    });
   }
 }
 
@@ -430,36 +525,59 @@ void ESPVideoCamera::loop() {
 void ESPVideoCamera::queue_frame_(const uint8_t *data, size_t length) {
   if (length == 0)
     return;
-  uint32_t now = millis();
-  if (this->min_interval_ms_ > 0 && (now - this->last_frame_ms_) < this->min_interval_ms_)
-    return;  // throttled to max_framerate
-  this->last_frame_ms_ = now;
+  if (!this->hardware_framerate_active_.load(std::memory_order_acquire)) {
+    const uint32_t now = millis();
+    const uint32_t min_interval =
+        this->min_interval_ms_.load(std::memory_order_acquire);
+    if (this->last_frame_ms_ != 0 && min_interval > 0 &&
+        (now - this->last_frame_ms_) < min_interval) {
+      return;
+    }
+    this->last_frame_ms_ = now;
+  }
 
-  uint8_t *copy = (uint8_t *) heap_caps_malloc(length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (copy == nullptr)
-    copy = (uint8_t *) heap_caps_malloc(length, MALLOC_CAP_8BIT);
+  uint8_t *copy = static_cast<uint8_t *>(
+      heap_caps_malloc(length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (copy == nullptr) {
-    ESP_LOGW(TAG, "Failed to allocate %u bytes (frame dropped)", (unsigned) length);
+    const uint32_t now = millis();
+    if (this->last_alloc_warning_ms_ == 0 ||
+        now - this->last_alloc_warning_ms_ >= 5000) {
+      ESP_LOGW(TAG, "Failed to allocate %u PSRAM bytes (frame dropped)",
+               (unsigned) length);
+      this->last_alloc_warning_ms_ = now;
+    }
     return;
   }
   memcpy(copy, data, length);
-  xSemaphoreTake(this->frame_mutex_, portMAX_DELAY);
-  if (this->pending_jpeg_ != nullptr)
-    heap_caps_free(this->pending_jpeg_);  // loop() was too slow: drop the old one
-  this->pending_jpeg_ = copy;
-  this->pending_jpeg_len_ = length;
-  xSemaphoreGive(this->frame_mutex_);
-}
-
-// Called FROM loop(): ownership of data moves to the image (its dtor frees it).
-void ESPVideoCamera::deliver_frame_owned_(uint8_t *data, size_t length) {
   const uint8_t single =
       this->single_requesters_.exchange(0, std::memory_order_acq_rel);
   const uint8_t streaming =
       this->stream_requesters_.load(std::memory_order_acquire);
-  this->current_image_ =
-      std::make_shared<ESPVideoCameraImage>(
-          data, length, static_cast<uint8_t>(single | streaming));
+  const uint8_t requesters = static_cast<uint8_t>(single | streaming);
+  if (requesters == 0) {
+    heap_caps_free(copy);
+    return;
+  }
+  this->capture_retry_attempts_.store(0, std::memory_order_release);
+  xSemaphoreTake(this->frame_mutex_, portMAX_DELAY);
+  if (this->pending_jpeg_ != nullptr) {
+    heap_caps_free(this->pending_jpeg_);  // loop() was too slow: drop oldest
+    this->pending_requesters_ =
+        static_cast<uint8_t>(this->pending_requesters_ | requesters);
+  } else {
+    this->pending_requesters_ = requesters;
+  }
+  this->pending_jpeg_ = copy;
+  this->pending_jpeg_len_ = length;
+  xSemaphoreGive(this->frame_mutex_);
+  this->enable_loop_soon_any_context();
+}
+
+// Called FROM loop(): ownership of data moves to the image (its dtor frees it).
+void ESPVideoCamera::deliver_frame_owned_(uint8_t *data, size_t length,
+                                          uint8_t requesters) {
+  this->current_image_ = std::make_shared<ESPVideoCameraImage>(
+      data, length, requesters);
   for (auto *listener : this->listeners_)
     listener->on_camera_image(this->current_image_);
 }
@@ -543,39 +661,82 @@ void ESPVideoCamera::capture_task_trampoline(void *param) {
 }
 
 void ESPVideoCamera::capture_task_run_() {
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // kicked by request_image/start_stream
-    if (!this->capture_wanted_.load())
-      continue;
-    if (!this->start_capture_()) {
-      this->stop_capture_();
+  while (this->capture_task_running_.load(std::memory_order_acquire)) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (!this->capture_task_running_.load(std::memory_order_acquire))
+      break;
+    if (this->capture_faulted_.load(std::memory_order_acquire)) {
+      if (this->stop_capture_())
+        this->capture_faulted_.store(false, std::memory_order_release);
+      this->capture_wanted_.store(false, std::memory_order_release);
+      this->schedule_capture_retry_();
       continue;
     }
-    this->ctrls_dirty_.store(true);   // fresh fds: re-apply the runtime settings
-    this->warmup_left_ = WARMUP_FRAMES;  // AE is cold: throw the first frames away
-    while (this->capture_wanted_.load()) {
-      this->apply_runtime_ctrls_();  // pick up HA/web settings between frames
+    if (!this->capture_wanted_.load(std::memory_order_acquire))
+      continue;
+    if (!this->start_capture_()) {
+      this->capture_faulted_.store(true, std::memory_order_release);
+      if (this->stop_capture_())
+        this->capture_faulted_.store(false, std::memory_order_release);
+      this->capture_wanted_.store(false, std::memory_order_release);
+      this->schedule_capture_retry_();
+      continue;
+    }
+    this->ctrls_dirty_.store(true);
+    if (this->is_raw_csi_)
+      this->raw_warmup_until_ms_ = millis() + RAW_WARMUP_MS;
+    while (this->capture_task_running_.load(std::memory_order_acquire) &&
+           this->capture_wanted_.load(std::memory_order_acquire) &&
+           !this->capture_faulted_.load(std::memory_order_acquire)) {
+      // DQBUF sleeps on esp_video's frame queue and has a bounded driver
+      // timeout. A healthy source wakes this task exactly when a frame arrives.
+      this->apply_runtime_ctrls_();
       if (this->is_hw_jpeg_ || this->is_raw_csi_) {
         this->loop_jpeg_pipeline_();
       } else {
         this->loop_direct_capture_();
       }
-      vTaskDelay(pdMS_TO_TICKS(1));  // yield (the CSI DQBUF is non-blocking → EAGAIN spin)
     }
-    this->stop_capture_();
+    if (this->capture_faulted_.load(std::memory_order_acquire)) {
+      if (this->stop_capture_())
+        this->capture_faulted_.store(false, std::memory_order_release);
+      this->schedule_capture_retry_();
+    } else if (!this->suspend_capture_()) {
+      this->capture_faulted_.store(true, std::memory_order_release);
+    }
   }
+
+  this->capture_wanted_.store(false, std::memory_order_release);
+  const bool capture_stopped = this->stop_capture_();
+  if (capture_stopped && this->pipeline_ready_) {
+    const esp_err_t error = esp_video_deinit();
+    if (error == ESP_OK) {
+      this->pipeline_ready_ = false;
+    } else {
+      ESP_LOGE(TAG, "esp_video shutdown failed: %s",
+               esp_err_to_name(error));
+    }
+  }
+  if (!capture_stopped)
+    ESP_LOGE(TAG, "Camera resources retained after an incomplete shutdown");
+  if (this->capture_task_done_ != nullptr)
+    xSemaphoreGive(this->capture_task_done_);
+  vTaskDelete(nullptr);
 }
 
 void ESPVideoCamera::loop_direct_capture_() {
   // The device already delivers JPEG/MJPEG frames; one MMAP capture queue.
-  struct v4l2_buffer buf;
-  memset(&buf, 0, sizeof(buf));
+  struct v4l2_buffer buf {};
   buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   buf.memory = V4L2_MEMORY_MMAP;
 
   if (ioctl(this->capture_fd_, VIDIOC_DQBUF, &buf) < 0) {
-    if (errno != EAGAIN)
-      ESP_LOGW(TAG, "VIDIOC_DQBUF failed: %s", strerror(errno));
+    if (errno == EINTR)
+      return;
+    ESP_LOGW(TAG, "VIDIOC_DQBUF failed; restarting capture: %s",
+             strerror(errno));
+    this->capture_faulted_.store(true, std::memory_order_release);
+    this->capture_wanted_.store(false, std::memory_order_release);
     return;
   }
 
@@ -591,204 +752,221 @@ void ESPVideoCamera::loop_direct_capture_() {
     }
   }
 
-  if (ioctl(this->capture_fd_, VIDIOC_QBUF, &buf) < 0)
-    ESP_LOGW(TAG, "VIDIOC_QBUF failed: %s", strerror(errno));
+  if (ioctl(this->capture_fd_, VIDIOC_QBUF, &buf) < 0) {
+    ESP_LOGW(TAG, "VIDIOC_QBUF failed; restarting capture: %s",
+             strerror(errno));
+    this->capture_faulted_.store(true, std::memory_order_release);
+    this->capture_wanted_.store(false, std::memory_order_release);
+  }
 }
 
 void ESPVideoCamera::loop_jpeg_pipeline_() {
-  // Dequeue one RGB565 frame from the sensor/ISP device (non-blocking).
+  // Dequeue one RGB565 frame from the sensor/ISP device. The capture task
+  // blocks in the driver until a frame or the configured timeout is delivered.
   struct v4l2_buffer cap_buf {};
   cap_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   cap_buf.memory = V4L2_MEMORY_MMAP;
   if (ioctl(this->capture_fd_, VIDIOC_DQBUF, &cap_buf) < 0) {
-    if (errno != EAGAIN)
-      ESP_LOGW(TAG, "capture DQBUF failed: %s", strerror(errno));
+    if (errno == EINTR)
+      return;
+    ESP_LOGW(TAG, "capture DQBUF failed; restarting pipeline: %s",
+             strerror(errno));
+    this->capture_faulted_.store(true, std::memory_order_release);
+    this->capture_wanted_.store(false, std::memory_order_release);
     return;
   }
 
   bool raw_requeued = false;
-  auto requeue_raw = [&]() {
+  auto requeue_raw = [&]() -> bool {
     if (raw_requeued)
-      return;
+      return true;
     if (ioctl(this->capture_fd_, VIDIOC_QBUF, &cap_buf) < 0) {
-      ESP_LOGW(TAG, "capture QBUF failed: %s", strerror(errno));
-      return;
+      ESP_LOGE(TAG, "capture QBUF failed: %s", strerror(errno));
+      this->capture_faulted_.store(true, std::memory_order_release);
+      this->capture_wanted_.store(false, std::memory_order_release);
+      return false;
     }
     raw_requeued = true;
+    return true;
+  };
+  auto fail_owned_input = [&](const char *operation) {
+    // Once OUTPUT accepts a USERPTR, only OUTPUT DQBUF or STREAMOFF can release
+    // it. Stop instead of reusing a buffer still owned by the JPEG device.
+    ESP_LOGE(TAG, "%s failed; stopping camera pipeline: %s", operation,
+             strerror(errno));
+    this->capture_faulted_.store(true, std::memory_order_release);
+    this->capture_wanted_.store(false, std::memory_order_release);
   };
 
-  if (cap_buf.index < (uint32_t) this->num_capture_buffers_ && cap_buf.bytesused > 0) {
-    const bool warming_up = this->warmup_left_ > 0;
-    const auto &raw_buffer = this->capture_buffers_[cap_buf.index];
-    if (!warming_up) {
-      const uint32_t timestamp_90khz = static_cast<uint32_t>(
-          (static_cast<uint64_t>(esp_timer_get_time()) * 9ULL) / 100ULL);
-      this->deliver_raw_frame_(
-          static_cast<const uint8_t *>(raw_buffer.start), cap_buf.bytesused,
-          static_cast<uint16_t>(this->capture_width_),
-          static_cast<uint16_t>(this->capture_height_),
-          static_cast<uint16_t>(this->capture_stride_bytes_),
-          timestamp_90khz);
-    }
+  if (cap_buf.index >= (uint32_t) this->num_capture_buffers_ ||
+      cap_buf.bytesused == 0) {
+    requeue_raw();
+    return;
+  }
 
-    const bool jpeg_wanted =
-        this->stream_requesters_.load(std::memory_order_acquire) != 0 ||
-        this->single_requesters_.load(std::memory_order_acquire) != 0 ||
-        this->jpeg_frame_consumer_active_.load(std::memory_order_acquire);
-    if (this->is_raw_csi_ || !jpeg_wanted) {
-      if (warming_up)
-        this->warmup_left_--;
+  // Espressif's V4L2 examples discard the first two CSI buffers after
+  // STREAMON. Do the same before a JPEG consumer can publish unstable ISP
+  // color or exposure as the first frame of a session.
+  if (this->startup_frames_remaining_ > 0) {
+    this->startup_frames_remaining_--;
+    requeue_raw();
+    return;
+  }
+
+  if (!this->has_consumers_()) {
+    requeue_raw();
+    return;
+  }
+
+  const bool raw_warming_up =
+      this->is_raw_csi_ &&
+      static_cast<int32_t>(millis() - this->raw_warmup_until_ms_) < 0;
+  const auto &raw_buffer = this->capture_buffers_[cap_buf.index];
+  if (!raw_warming_up) {
+    const uint32_t timestamp_90khz = static_cast<uint32_t>(
+        (static_cast<uint64_t>(esp_timer_get_time()) * 9ULL) / 100ULL);
+    this->deliver_raw_frame_(
+        static_cast<const uint8_t *>(raw_buffer.start), cap_buf.bytesused,
+        static_cast<uint16_t>(this->capture_width_),
+        static_cast<uint16_t>(this->capture_height_),
+        static_cast<uint16_t>(this->capture_stride_bytes_), timestamp_90khz);
+  }
+
+  const bool jpeg_wanted =
+      this->stream_requesters_.load(std::memory_order_acquire) != 0 ||
+      this->single_requesters_.load(std::memory_order_acquire) != 0 ||
+      this->jpeg_frame_consumer_active_.load(std::memory_order_acquire);
+  if (this->is_raw_csi_ || !jpeg_wanted) {
+    requeue_raw();
+    return;
+  }
+
+  const uint8_t *jpeg_input =
+      static_cast<const uint8_t *>(raw_buffer.start);
+  size_t jpeg_input_bytes = cap_buf.bytesused;
+  size_t jpeg_input_alloc_size = raw_buffer.length;
+
+  if (this->ppa_transform_required_) {
+    const size_t expected_input_bytes =
+        static_cast<size_t>(this->capture_width_) * this->capture_height_ *
+        sizeof(uint16_t);
+    if (this->ppa_srm_ == nullptr || this->transformed_rgb565_ == nullptr ||
+        cap_buf.bytesused < expected_input_bytes) {
+      ESP_LOGE(TAG, "PPA transform input is unavailable or truncated");
       requeue_raw();
       return;
     }
 
-    const uint8_t *jpeg_input =
-        static_cast<const uint8_t *>(raw_buffer.start);
-    size_t jpeg_input_bytes = cap_buf.bytesused;
-    size_t jpeg_input_alloc_size = raw_buffer.length;
+    ppa_srm_oper_config_t operation {};
+    operation.in.buffer = raw_buffer.start;
+    operation.in.pic_w = this->capture_width_;
+    operation.in.pic_h = this->capture_height_;
+    operation.in.block_w = this->capture_width_;
+    operation.in.block_h = this->capture_height_;
+    operation.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+    operation.out.buffer = this->transformed_rgb565_;
+    operation.out.buffer_size =
+        static_cast<uint32_t>(this->transformed_rgb565_alloc_size_);
+    operation.out.pic_w = this->jpeg_width_;
+    operation.out.pic_h = this->jpeg_height_;
+    operation.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+    operation.rotation_angle =
+        ppa_rotation_for_clockwise(this->rotation_degrees_);
+    operation.scale_x = this->ppa_scale_x_;
+    operation.scale_y = this->ppa_scale_y_;
+    operation.rgb_swap = false;
+    operation.byte_swap = false;
+    operation.mode = PPA_TRANS_MODE_BLOCKING;
 
-    if (this->ppa_transform_required_) {
-      const size_t expected_input_bytes =
-          static_cast<size_t>(this->capture_width_) * this->capture_height_ *
-          sizeof(uint16_t);
-      if (this->ppa_srm_ == nullptr ||
-          this->transformed_rgb565_ == nullptr ||
-          cap_buf.bytesused < expected_input_bytes) {
-        ESP_LOGE(TAG, "PPA transform input is unavailable or truncated");
-        requeue_raw();
-        return;
-      }
-
-      ppa_srm_oper_config_t operation {};
-      operation.in.buffer = raw_buffer.start;
-      operation.in.pic_w = this->capture_width_;
-      operation.in.pic_h = this->capture_height_;
-      operation.in.block_w = this->capture_width_;
-      operation.in.block_h = this->capture_height_;
-      operation.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-      operation.out.buffer = this->transformed_rgb565_;
-      operation.out.buffer_size =
-          static_cast<uint32_t>(this->transformed_rgb565_alloc_size_);
-      operation.out.pic_w = this->jpeg_width_;
-      operation.out.pic_h = this->jpeg_height_;
-      operation.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-      operation.rotation_angle =
-          ppa_rotation_for_clockwise(this->rotation_degrees_);
-      operation.scale_x = this->ppa_scale_x_;
-      operation.scale_y = this->ppa_scale_y_;
-      operation.rgb_swap = false;
-      operation.byte_swap = false;
-      operation.mode = PPA_TRANS_MODE_BLOCKING;
-
-      const esp_err_t error =
-          ppa_do_scale_rotate_mirror(this->ppa_srm_, &operation);
-      if (error != ESP_OK) {
-        ESP_LOGE(TAG, "PPA camera transform failed; frame dropped: %s",
-                 esp_err_to_name(error));
-        requeue_raw();
-        return;
-      }
-
-      // Blocking mode has finished reading the sensor MMAP buffer. JPEG owns
-      // only the persistent transformed buffer, so return the raw frame now.
+    const esp_err_t error =
+        ppa_do_scale_rotate_mirror(this->ppa_srm_, &operation);
+    if (error != ESP_OK) {
+      ESP_LOGE(TAG, "PPA camera transform failed; frame dropped: %s",
+               esp_err_to_name(error));
       requeue_raw();
-      jpeg_input = this->transformed_rgb565_;
-      jpeg_input_bytes = this->transformed_rgb565_bytes_;
-      jpeg_input_alloc_size = this->transformed_rgb565_alloc_size_;
+      return;
     }
 
-    // Feed the raw frame to the encoder OUTPUT queue (USERPTR) and re-arm the
-    // CAPTURE queue (JPEG output). The JPEG fd is blocking, so the DQBUFs below
-    // wait for the (fast) hardware encode to finish.
-    struct v4l2_buffer out_buf {};
-    out_buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    out_buf.memory = V4L2_MEMORY_USERPTR;
-    out_buf.index = 0;
-    out_buf.m.userptr = reinterpret_cast<unsigned long>(jpeg_input);
-    out_buf.length = jpeg_input_alloc_size;
-    out_buf.bytesused = jpeg_input_bytes;
-
-    struct v4l2_buffer jpeg_buf {};
-    jpeg_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    jpeg_buf.memory = V4L2_MEMORY_MMAP;
-    jpeg_buf.index = 0;
-
-    // FORK: diagnostics for a stuck DQBUF — markers for the first 3 frames only.
-    // A stall now blocks the background task instead of loopTask, so the board
-    // stays alive and the last marker points at the culprit.
-    bool dbg = this->dbg_frames_ < 3;
-    if (dbg)
-      ESP_LOGI(TAG, "dbg: QBUF out+cap");
-    const bool output_queued =
-        ioctl(this->jpeg_fd_, VIDIOC_QBUF, &out_buf) == 0;
-    if (output_queued &&
-        ioctl(this->jpeg_fd_, VIDIOC_QBUF, &jpeg_buf) == 0) {
-      // FORK: THE DQBUF ORDER IS CRITICAL on esp_video 2.2.0. Encoding is lazy:
-      // esp_video_recv_element triggers m2m_process ONLY for a DQBUF on the
-      // CAPTURE queue (jpeg_video_notify: type == CAPTURE). The original PR did
-      // DQBUF(OUTPUT) first — that never starts the encode and blocks on
-      // ready_sem FOREVER (this was the watchdog hang). So: CAPTURE first (kicks
-      // the encode off and waits for it), then OUTPUT (the input buffer has
-      // already been released by then, so it returns immediately).
-      memset(&jpeg_buf, 0, sizeof(jpeg_buf));
-      jpeg_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-      jpeg_buf.memory = V4L2_MEMORY_MMAP;
-      if (dbg)
-        ESP_LOGI(TAG, "dbg: DQBUF jpeg(cap)");
-      if (ioctl(this->jpeg_fd_, VIDIOC_DQBUF, &jpeg_buf) == 0) {
-        if (dbg)
-          ESP_LOGI(TAG, "dbg: frame %u bytes", (unsigned) jpeg_buf.bytesused);
-        this->dbg_frames_++;
-        // Warmup is counted in SENSOR frames (before the max_framerate throttle):
-        // AE converges in ~10 frames = ~220 ms @45 fps, otherwise an event
-        // snapshot comes out black.
-        if (this->warmup_left_ > 0) {
-          this->warmup_left_--;
-        } else {
-          const auto *jpeg_data = static_cast<const uint8_t *>(
-              this->jpeg_out_buffer_.start);
-          const uint32_t timestamp_90khz = static_cast<uint32_t>(
-              (static_cast<uint64_t>(esp_timer_get_time()) * 9ULL) / 100ULL);
-          this->deliver_jpeg_frame_(
-              jpeg_data, jpeg_buf.bytesused, timestamp_90khz);
-          if (this->stream_requesters_.load(std::memory_order_acquire) != 0 ||
-              this->single_requesters_.load(std::memory_order_acquire) != 0) {
-            this->queue_frame_(jpeg_data, jpeg_buf.bytesused);
-          }
-        }
-      } else {
-        ESP_LOGW(TAG, "JPEG DQBUF failed: %s", strerror(errno));
-      }
-
-      // Reclaim the consumed input buffer (post-encode, so it does not block).
-      struct v4l2_buffer done_buf {};
-      done_buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-      done_buf.memory = V4L2_MEMORY_USERPTR;
-      if (dbg)
-        ESP_LOGI(TAG, "dbg: DQBUF done(out)");
-      if (ioctl(this->jpeg_fd_, VIDIOC_DQBUF, &done_buf) < 0) {
-        ESP_LOGE(TAG, "JPEG OUTPUT DQBUF failed; stopping capture: %s",
-                 strerror(errno));
-        this->capture_wanted_.store(false);
-        return;
-      }
-    } else {
-      ESP_LOGW(TAG, "JPEG encoder QBUF failed: %s", strerror(errno));
-      if (output_queued) {
-        // OUTPUT now owns its USERPTR. STREAMOFF is the only safe release if
-        // CAPTURE could not be queued; do not overwrite or requeue it.
-        this->capture_wanted_.store(false);
-        return;
-      }
-    }
+    // Blocking PPA has finished reading the sensor buffer. JPEG owns only the
+    // persistent transform buffer, so return the sensor frame immediately.
+    if (!requeue_raw())
+      return;
+    jpeg_input = this->transformed_rgb565_;
+    jpeg_input_bytes = this->transformed_rgb565_bytes_;
+    jpeg_input_alloc_size = this->transformed_rgb565_alloc_size_;
   }
 
-  // Return the raw frame to the sensor/ISP device.
-  requeue_raw();
+  struct v4l2_buffer out_buf {};
+  out_buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+  out_buf.memory = V4L2_MEMORY_USERPTR;
+  out_buf.index = 0;
+  out_buf.m.userptr = reinterpret_cast<unsigned long>(jpeg_input);
+  out_buf.length = jpeg_input_alloc_size;
+  out_buf.bytesused = jpeg_input_bytes;
+
+  struct v4l2_buffer jpeg_buf {};
+  jpeg_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  jpeg_buf.memory = V4L2_MEMORY_MMAP;
+  jpeg_buf.index = 0;
+
+  const bool dbg = this->dbg_frames_ < 3;
+  if (dbg)
+    ESP_LOGI(TAG, "dbg: QBUF out+cap");
+  if (ioctl(this->jpeg_fd_, VIDIOC_QBUF, &out_buf) < 0) {
+    ESP_LOGW(TAG, "JPEG OUTPUT QBUF failed: %s", strerror(errno));
+    requeue_raw();
+    return;
+  }
+  if (ioctl(this->jpeg_fd_, VIDIOC_QBUF, &jpeg_buf) < 0) {
+    fail_owned_input("JPEG CAPTURE QBUF");
+    return;
+  }
+
+  // esp_video 2.3.0 triggers lazy M2M processing from CAPTURE DQBUF. OUTPUT
+  // DQBUF must follow it; reversing the order blocks on ready_sem.
+  memset(&jpeg_buf, 0, sizeof(jpeg_buf));
+  jpeg_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  jpeg_buf.memory = V4L2_MEMORY_MMAP;
+  if (dbg)
+    ESP_LOGI(TAG, "dbg: DQBUF jpeg(cap)");
+  if (ioctl(this->jpeg_fd_, VIDIOC_DQBUF, &jpeg_buf) < 0) {
+    fail_owned_input("JPEG CAPTURE DQBUF");
+    return;
+  }
+
+  struct v4l2_buffer done_buf {};
+  done_buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+  done_buf.memory = V4L2_MEMORY_USERPTR;
+  if (dbg)
+    ESP_LOGI(TAG, "dbg: DQBUF done(out)");
+  if (ioctl(this->jpeg_fd_, VIDIOC_DQBUF, &done_buf) < 0) {
+    fail_owned_input("JPEG OUTPUT DQBUF");
+    return;
+  }
+  if (!requeue_raw())
+    return;
+
+  if (dbg) {
+    ESP_LOGI(TAG, "dbg: frame %u bytes", (unsigned) jpeg_buf.bytesused);
+    this->dbg_frames_++;
+  }
+  if (jpeg_buf.bytesused > this->jpeg_out_buffer_.length) {
+    ESP_LOGE(TAG, "JPEG encoder returned an oversized frame");
+    this->capture_faulted_.store(true, std::memory_order_release);
+    this->capture_wanted_.store(false, std::memory_order_release);
+    return;
+  }
+  const auto *jpeg_data =
+      static_cast<const uint8_t *>(this->jpeg_out_buffer_.start);
+  const uint32_t timestamp_90khz = static_cast<uint32_t>(
+      (static_cast<uint64_t>(esp_timer_get_time()) * 9ULL) / 100ULL);
+  this->deliver_jpeg_frame_(jpeg_data, jpeg_buf.bytesused, timestamp_90khz);
+  if (this->stream_requesters_.load(std::memory_order_acquire) != 0 ||
+      this->single_requesters_.load(std::memory_order_acquire) != 0) {
+    this->queue_frame_(jpeg_data, jpeg_buf.bytesused);
+  }
 }
 
-// FORK: invoke borrowed-frame consumers synchronously while their V4L2 buffer
-// is still owned by this task.
 void ESPVideoCamera::deliver_raw_frame_(
     const uint8_t *data, size_t size, uint16_t width, uint16_t height,
     uint16_t stride_bytes, uint32_t timestamp_90khz) {
@@ -799,8 +977,8 @@ void ESPVideoCamera::deliver_raw_frame_(
     return;
   }
   consumer->consume_raw_video_frame(
-      RawVideoFrame{data, size, width, height, stride_bytes,
-                    timestamp_90khz, 0});
+      RawVideoFrame{data, size, width, height, stride_bytes, timestamp_90khz,
+                    this->rotation_degrees_});
 }
 
 void ESPVideoCamera::deliver_jpeg_frame_(const uint8_t *data, size_t size,
@@ -917,10 +1095,28 @@ bool ESPVideoCamera::has_consumers_() const {
 void ESPVideoCamera::update_capture_state_() {
   const bool wanted = this->has_consumers_();
   if (wanted) {
-    this->capture_wanted_.store(true);
+    this->capture_retry_attempts_.store(0, std::memory_order_release);
+    this->capture_wanted_.store(true, std::memory_order_release);
     if (this->capture_task_ != nullptr)
       xTaskNotifyGive(this->capture_task_);
   }
+  this->enable_loop_soon_any_context();
+}
+
+void ESPVideoCamera::schedule_capture_retry_() {
+  if (!this->has_consumers_())
+    return;
+  const uint8_t attempt =
+      this->capture_retry_attempts_.fetch_add(1, std::memory_order_acq_rel);
+  if (attempt >= MAX_CAPTURE_RETRIES) {
+    if (attempt == MAX_CAPTURE_RETRIES) {
+      ESP_LOGE(TAG,
+               "Camera recovery exhausted; waiting for a new image request");
+    }
+    return;
+  }
+  this->capture_retry_requested_.store(true, std::memory_order_release);
+  this->enable_loop_soon_any_context();
 }
 
 bool ESPVideoCamera::configure_capture_format_(uint32_t pixelformat) {
@@ -1120,6 +1316,72 @@ bool ESPVideoCamera::release_transform_() {
   return true;
 }
 
+bool ESPVideoCamera::configure_capture_framerate_() {
+  const float requested_fps =
+      this->max_framerate_.load(std::memory_order_acquire);
+  if (requested_fps < 1.0f)
+    return false;
+
+  struct v4l2_streamparm parm {};
+  parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (ioctl(this->capture_fd_, VIDIOC_G_PARM, &parm) < 0) {
+    ESP_LOGW(TAG, "capture VIDIOC_G_PARM failed; using software throttle: %s",
+             strerror(errno));
+    return false;
+  }
+
+  auto &capture = parm.parm.capture;
+  const uint32_t reported_fps = capture.timeperframe.denominator;
+  if ((capture.capability & V4L2_CAP_TIMEPERFRAME) == 0 ||
+      capture.timeperframe.numerator != 1 || reported_fps == 0) {
+    ESP_LOGW(TAG, "capture device does not expose a usable integer frame rate");
+    return false;
+  }
+  if (this->native_capture_fps_ == 0 ||
+      reported_fps > this->native_capture_fps_) {
+    this->native_capture_fps_ = reported_fps;
+  }
+  const uint32_t source_fps = this->native_capture_fps_;
+
+  uint32_t target_fps =
+      static_cast<uint32_t>(std::floor(requested_fps));
+  target_fps = std::clamp<uint32_t>(target_fps, 1, source_fps);
+  while (target_fps > 1 && source_fps % target_fps != 0)
+    target_fps--;
+
+  if (target_fps == reported_fps) {
+    ESP_LOGI(TAG, "Capture framerate: %u fps", (unsigned) reported_fps);
+    return true;
+  }
+
+  // esp_video CSI accepts numerator=1 and an integer divisor of the native
+  // sensor rate, then skips frames in its ISR before they reach DQBUF.
+  capture.timeperframe.numerator = 1;
+  capture.timeperframe.denominator = target_fps;
+  if (ioctl(this->capture_fd_, VIDIOC_S_PARM, &parm) < 0) {
+    ESP_LOGW(TAG,
+             "capture VIDIOC_S_PARM %u fps failed; using software throttle: %s",
+             (unsigned) target_fps, strerror(errno));
+    return false;
+  }
+
+  struct v4l2_streamparm actual {};
+  actual.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (ioctl(this->capture_fd_, VIDIOC_G_PARM, &actual) == 0 &&
+      actual.parm.capture.timeperframe.numerator == 1 &&
+      actual.parm.capture.timeperframe.denominator > 0) {
+    const uint32_t actual_fps =
+        actual.parm.capture.timeperframe.denominator;
+    ESP_LOGI(TAG, "Capture framerate: %u fps (source %u fps)",
+             (unsigned) actual_fps, (unsigned) source_fps);
+    if (actual_fps <= target_fps)
+      return true;
+  }
+  ESP_LOGW(TAG,
+           "capture framerate could not be confirmed; using software throttle");
+  return false;
+}
+
 bool ESPVideoCamera::setup_capture_buffers_() {
   struct v4l2_requestbuffers req;
   memset(&req, 0, sizeof(req));
@@ -1164,7 +1426,26 @@ bool ESPVideoCamera::start_capture_() {
     return true;
   if (this->is_failed())
     return false;
+  if (this->capture_prepared_) {
+    if (!this->resume_capture_())
+      return false;
+    if (this->is_hw_jpeg_)
+      this->startup_frames_remaining_ = STARTUP_FRAME_COUNT;
+    this->last_frame_ms_ = 0;
+    return true;
+  }
+  if (this->capture_fd_ >= 0 || this->jpeg_fd_ >= 0 ||
+      this->ppa_srm_ != nullptr) {
+    if (!this->stop_capture_())
+      return false;
+    if (this->capture_fd_ >= 0 || this->jpeg_fd_ >= 0 ||
+        this->ppa_srm_ != nullptr) {
+      ESP_LOGE(TAG, "Previous camera resources are still owned");
+      return false;
+    }
+  }
 
+  this->hardware_framerate_active_.store(false, std::memory_order_release);
   bool ok = (this->is_hw_jpeg_ || this->is_raw_csi_)
                 ? this->start_jpeg_pipeline_()
                 : this->start_direct_capture_();
@@ -1173,40 +1454,166 @@ bool ESPVideoCamera::start_capture_() {
     return false;
   }
   this->log_sensor_controls_();  // one-shot: dump the sensor/ISP V4L2 controls
+  this->capture_prepared_ = true;
+  this->capture_faulted_.store(false, std::memory_order_release);
   this->streaming_ = true;
+  if (this->is_hw_jpeg_)
+    this->startup_frames_remaining_ = STARTUP_FRAME_COUNT;
   this->last_frame_ms_ = 0;
   return true;
 }
 
+bool ESPVideoCamera::resume_capture_() {
+  if (!this->capture_prepared_ || this->capture_fd_ < 0 ||
+      this->num_capture_buffers_ <= 0) {
+    return false;
+  }
+  if (this->capture_streaming_ || this->jpeg_output_streaming_ ||
+      this->jpeg_capture_streaming_) {
+    ESP_LOGE(TAG, "Cannot resume partially active V4L2 queues");
+    return false;
+  }
+  if (this->is_hw_jpeg_ &&
+      (this->jpeg_fd_ < 0 || this->jpeg_out_buffer_.start == nullptr ||
+       (this->ppa_transform_required_ &&
+        (this->ppa_srm_ == nullptr ||
+         this->transformed_rgb565_ == nullptr)))) {
+    ESP_LOGE(TAG, "Prepared JPEG pipeline is incomplete");
+    return false;
+  }
+
+  if (this->is_hw_jpeg_ || this->is_raw_csi_) {
+    this->hardware_framerate_active_.store(
+        this->configure_capture_framerate_(), std::memory_order_release);
+  }
+
+  for (int i = 0; i < this->num_capture_buffers_; i++) {
+    struct v4l2_buffer buffer {};
+    buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buffer.memory = V4L2_MEMORY_MMAP;
+    buffer.index = i;
+    if (ioctl(this->capture_fd_, VIDIOC_QBUF, &buffer) < 0) {
+      ESP_LOGE(TAG, "resume VIDIOC_QBUF[%d] failed: %s", i,
+               strerror(errno));
+      return false;
+    }
+  }
+
+  clamp_isp_log_levels();
+  int capture_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (ioctl(this->capture_fd_, VIDIOC_STREAMON, &capture_type) < 0) {
+    ESP_LOGE(TAG, "resume capture STREAMON failed: %s", strerror(errno));
+    return false;
+  }
+  this->capture_streaming_ = true;
+
+  if (this->is_hw_jpeg_) {
+    int output_type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    int jpeg_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(this->jpeg_fd_, VIDIOC_STREAMON, &output_type) < 0) {
+      ESP_LOGE(TAG, "resume JPEG OUTPUT STREAMON failed: %s",
+               strerror(errno));
+      this->suspend_capture_();
+      return false;
+    }
+    this->jpeg_output_streaming_ = true;
+    if (ioctl(this->jpeg_fd_, VIDIOC_STREAMON, &jpeg_type) < 0) {
+      ESP_LOGE(TAG, "resume JPEG CAPTURE STREAMON failed: %s",
+               strerror(errno));
+      this->suspend_capture_();
+      return false;
+    }
+    this->jpeg_capture_streaming_ = true;
+  }
+
+  this->capture_faulted_.store(false, std::memory_order_release);
+  this->streaming_ = true;
+  return true;
+}
+
+bool ESPVideoCamera::suspend_capture_() {
+  bool stopped = true;
+  if (this->jpeg_fd_ >= 0 && this->jpeg_output_streaming_) {
+    int output_type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    if (ioctl(this->jpeg_fd_, VIDIOC_STREAMOFF, &output_type) == 0) {
+      this->jpeg_output_streaming_ = false;
+    } else {
+      ESP_LOGE(TAG, "JPEG OUTPUT STREAMOFF failed: %s", strerror(errno));
+      stopped = false;
+    }
+  }
+  if (this->jpeg_fd_ >= 0 && this->jpeg_capture_streaming_) {
+    int jpeg_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(this->jpeg_fd_, VIDIOC_STREAMOFF, &jpeg_type) == 0) {
+      this->jpeg_capture_streaming_ = false;
+    } else {
+      ESP_LOGE(TAG, "JPEG CAPTURE STREAMOFF failed: %s", strerror(errno));
+      stopped = false;
+    }
+  }
+  if (this->capture_fd_ >= 0 && this->capture_streaming_) {
+    int capture_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(this->capture_fd_, VIDIOC_STREAMOFF, &capture_type) == 0) {
+      this->capture_streaming_ = false;
+    } else {
+      ESP_LOGE(TAG, "capture STREAMOFF failed: %s", strerror(errno));
+      stopped = false;
+    }
+  }
+  this->streaming_ = this->capture_streaming_ ||
+                     this->jpeg_output_streaming_ ||
+                     this->jpeg_capture_streaming_;
+  return stopped && !this->streaming_;
+}
+
 bool ESPVideoCamera::start_direct_capture_() {
-  this->capture_fd_ = open(this->resolved_device_.c_str(), O_RDWR | O_NONBLOCK);
+  this->capture_fd_ = open(this->resolved_device_.c_str(), O_RDWR);
   if (this->capture_fd_ < 0) {
     ESP_LOGE(TAG, "open(%s) failed: %s", this->resolved_device_.c_str(), strerror(errno));
     return false;
   }
   if (!this->configure_capture_format_(V4L2_PIX_FMT_MJPEG))
     return false;
+  this->hardware_framerate_active_.store(
+      this->configure_capture_framerate_(), std::memory_order_release);
   if (!this->setup_capture_buffers_())
     return false;
+  struct timeval dequeue_timeout {2, 0};
+  if (ioctl(this->capture_fd_, VIDIOC_S_DQBUF_TIMEOUT,
+            &dequeue_timeout) < 0) {
+    ESP_LOGE(TAG, "VIDIOC_S_DQBUF_TIMEOUT failed: %s", strerror(errno));
+    return false;
+  }
   int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   if (ioctl(this->capture_fd_, VIDIOC_STREAMON, &type) < 0) {
     ESP_LOGE(TAG, "VIDIOC_STREAMON failed: %s", strerror(errno));
     return false;
   }
+  this->capture_streaming_ = true;
   return true;
 }
 
 bool ESPVideoCamera::start_jpeg_pipeline_() {
   // Stage 1: sensor/ISP capture device producing RGB565 frames.
-  this->capture_fd_ = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDWR | O_NONBLOCK);
+  this->capture_fd_ = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDWR);
   if (this->capture_fd_ < 0) {
     ESP_LOGE(TAG, "open(%s) failed: %s", ESP_VIDEO_MIPI_CSI_DEVICE_NAME, strerror(errno));
     return false;
   }
   if (!this->configure_capture_format_(V4L2_PIX_FMT_RGB565))
     return false;
+  this->hardware_framerate_active_.store(
+      this->configure_capture_framerate_(), std::memory_order_release);
   if (!this->setup_capture_buffers_())
     return false;
+  struct timeval dequeue_timeout {2, 0};
+  if (ioctl(this->capture_fd_, VIDIOC_S_DQBUF_TIMEOUT,
+            &dequeue_timeout) < 0) {
+    ESP_LOGE(TAG, "capture VIDIOC_S_DQBUF_TIMEOUT failed: %s",
+             strerror(errno));
+    return false;
+  }
+  clamp_isp_log_levels();
   if (!this->setup_transform_())
     return false;
   int ctype = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -1214,6 +1621,8 @@ bool ESPVideoCamera::start_jpeg_pipeline_() {
     ESP_LOGE(TAG, "capture STREAMON failed: %s", strerror(errno));
     return false;
   }
+  this->capture_streaming_ = true;
+  clamp_isp_log_levels();
 
   if (this->is_raw_csi_)
     return true;
@@ -1223,6 +1632,12 @@ bool ESPVideoCamera::start_jpeg_pipeline_() {
   this->jpeg_fd_ = open(ESP_VIDEO_JPEG_DEVICE_NAME, O_RDWR);
   if (this->jpeg_fd_ < 0) {
     ESP_LOGE(TAG, "open(%s) failed: %s", ESP_VIDEO_JPEG_DEVICE_NAME, strerror(errno));
+    return false;
+  }
+  if (ioctl(this->jpeg_fd_, VIDIOC_S_DQBUF_TIMEOUT,
+            &dequeue_timeout) < 0) {
+    ESP_LOGE(TAG, "JPEG VIDIOC_S_DQBUF_TIMEOUT failed: %s",
+             strerror(errno));
     return false;
   }
 
@@ -1294,46 +1709,92 @@ bool ESPVideoCamera::start_jpeg_pipeline_() {
   }
 
   int otype = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-  int jtype = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  if (ioctl(this->jpeg_fd_, VIDIOC_STREAMON, &otype) < 0 || ioctl(this->jpeg_fd_, VIDIOC_STREAMON, &jtype) < 0) {
-    ESP_LOGE(TAG, "JPEG STREAMON failed: %s", strerror(errno));
+  if (ioctl(this->jpeg_fd_, VIDIOC_STREAMON, &otype) < 0) {
+    ESP_LOGE(TAG, "JPEG OUTPUT STREAMON failed: %s", strerror(errno));
     return false;
   }
+  this->jpeg_output_streaming_ = true;
+  int jtype = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (ioctl(this->jpeg_fd_, VIDIOC_STREAMON, &jtype) < 0) {
+    ESP_LOGE(TAG, "JPEG CAPTURE STREAMON failed: %s", strerror(errno));
+    return false;
+  }
+  this->jpeg_capture_streaming_ = true;
   return true;
 }
 
-void ESPVideoCamera::stop_capture_() {
+bool ESPVideoCamera::stop_capture_() {
+  if (!this->suspend_capture_()) {
+    ESP_LOGE(TAG, "Camera teardown deferred: V4L2 queue still active");
+    return false;
+  }
+
   if (this->jpeg_fd_ >= 0) {
-    int otype = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    int jtype = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ioctl(this->jpeg_fd_, VIDIOC_STREAMOFF, &otype);
-    ioctl(this->jpeg_fd_, VIDIOC_STREAMOFF, &jtype);
     if (this->jpeg_out_buffer_.start != nullptr) {
-      munmap(this->jpeg_out_buffer_.start, this->jpeg_out_buffer_.length);
+      if (munmap(this->jpeg_out_buffer_.start,
+                 this->jpeg_out_buffer_.length) < 0) {
+        ESP_LOGE(TAG, "JPEG munmap failed: %s", strerror(errno));
+        return false;
+      }
       this->jpeg_out_buffer_.start = nullptr;
+      this->jpeg_out_buffer_.length = 0;
     }
-    close(this->jpeg_fd_);
+    struct v4l2_requestbuffers release {};
+    release.count = 0;
+    release.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    release.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(this->jpeg_fd_, VIDIOC_REQBUFS, &release) < 0) {
+      ESP_LOGE(TAG, "JPEG CAPTURE REQBUFS(0) failed: %s", strerror(errno));
+      return false;
+    }
+    release.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    release.memory = V4L2_MEMORY_USERPTR;
+    if (ioctl(this->jpeg_fd_, VIDIOC_REQBUFS, &release) < 0) {
+      ESP_LOGE(TAG, "JPEG OUTPUT REQBUFS(0) failed: %s", strerror(errno));
+      return false;
+    }
+    if (close(this->jpeg_fd_) < 0)
+      ESP_LOGE(TAG, "JPEG close failed: %s", strerror(errno));
     this->jpeg_fd_ = -1;
   }
   if (!this->release_transform_()) {
     this->streaming_ = false;
-    this->mark_failed();
-    return;
+    return false;
   }
   if (this->capture_fd_ >= 0) {
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ioctl(this->capture_fd_, VIDIOC_STREAMOFF, &type);
     for (int i = 0; i < this->num_capture_buffers_; i++) {
       if (this->capture_buffers_[i].start != nullptr) {
-        munmap(this->capture_buffers_[i].start, this->capture_buffers_[i].length);
+        if (munmap(this->capture_buffers_[i].start,
+                   this->capture_buffers_[i].length) < 0) {
+          ESP_LOGE(TAG, "capture munmap[%d] failed: %s", i,
+                   strerror(errno));
+          return false;
+        }
         this->capture_buffers_[i].start = nullptr;
+        this->capture_buffers_[i].length = 0;
       }
     }
-    close(this->capture_fd_);
+    struct v4l2_requestbuffers release {};
+    release.count = 0;
+    release.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    release.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(this->capture_fd_, VIDIOC_REQBUFS, &release) < 0) {
+      ESP_LOGE(TAG, "capture REQBUFS(0) failed: %s", strerror(errno));
+      return false;
+    }
+    if (close(this->capture_fd_) < 0)
+      ESP_LOGE(TAG, "capture close failed: %s", strerror(errno));
     this->capture_fd_ = -1;
   }
   this->num_capture_buffers_ = 0;
+  this->capture_prepared_ = false;
   this->streaming_ = false;
+  this->capture_streaming_ = false;
+  this->jpeg_output_streaming_ = false;
+  this->jpeg_capture_streaming_ = false;
+  this->hardware_framerate_active_.store(false,
+                                         std::memory_order_release);
+  return true;
 }
 
 void ESPVideoCamera::dump_config() {
@@ -1348,7 +1809,8 @@ void ESPVideoCamera::dump_config() {
   } else if (this->is_raw_csi_) {
     ESP_LOGCONFIG(TAG, "  Output: raw CSI consumer only");
   }
-  ESP_LOGCONFIG(TAG, "  Max framerate: %.1f fps", this->max_framerate_);
+  ESP_LOGCONFIG(TAG, "  Max framerate: %.1f fps",
+                this->max_framerate_.load(std::memory_order_acquire));
   if (this->is_failed())
     ESP_LOGCONFIG(TAG, "  State: FAILED");
 }

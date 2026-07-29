@@ -107,6 +107,7 @@ class ESPVideoCameraImageReader : public camera::CameraImageReader {
 class ESPVideoCamera : public camera::Camera {
  public:
   void setup() override;
+  void on_shutdown() override;
   void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
@@ -124,8 +125,10 @@ class ESPVideoCamera : public camera::Camera {
   void set_jpeg_quality(int quality) { this->jpeg_quality_ = quality; }
   void set_rotation(uint16_t rotation) { this->rotation_degrees_ = rotation; }
   void set_max_framerate(float fps) {
-    this->max_framerate_ = fps;
-    this->min_interval_ms_ = (fps > 0.0f) ? (uint32_t) (1000.0f / fps) : 0;
+    this->max_framerate_.store(fps, std::memory_order_release);
+    this->min_interval_ms_.store(
+        (fps > 0.0f) ? (uint32_t) (1000.0f / fps) : 0,
+        std::memory_order_release);
   }
 
   // FORK: runtime settings coming from Home Assistant / the web server. The
@@ -149,7 +152,12 @@ class ESPVideoCamera : public camera::Camera {
     this->ctrls_dirty_.store(true);
   }
   void set_runtime_max_fps(float fps) {
-    this->min_interval_ms_ = (fps > 0.0f) ? (uint32_t) (1000.0f / fps) : 0;
+    this->max_framerate_.store(fps, std::memory_order_release);
+    this->min_interval_ms_.store(
+        (fps > 0.0f) ? (uint32_t) (1000.0f / fps) : 0,
+        std::memory_order_release);
+    this->hardware_framerate_active_.store(false,
+                                           std::memory_order_release);
   }
 
   // camera::Camera -------------------------------------------------------------
@@ -172,8 +180,11 @@ class ESPVideoCamera : public camera::Camera {
  protected:
   bool init_pipeline_();
   bool start_capture_();
-  void stop_capture_();
+  bool resume_capture_();
+  bool suspend_capture_();
+  bool stop_capture_();
   void update_capture_state_();
+  void schedule_capture_retry_();
   bool has_consumers_() const;
 
   // FORK: capture moved out of loop() into a dedicated FreeRTOS task. The
@@ -187,7 +198,8 @@ class ESPVideoCamera : public camera::Camera {
   // From the task: copy the finished JPEG into PSRAM and park it in the slot.
   void queue_frame_(const uint8_t *data, size_t length);
   // From loop(): hand the copy to the listeners (ownership moves to the image).
-  void deliver_frame_owned_(uint8_t *data, size_t length);
+  void deliver_frame_owned_(uint8_t *data, size_t length,
+                            uint8_t requesters);
   // FORK: one-shot enumeration of the sensor/ISP V4L2 controls into the log —
   // shows what the hardware actually supports (flip/brightness/exposure/...)
   // so that runtime settings can be wired up against real controls.
@@ -195,6 +207,7 @@ class ESPVideoCamera : public camera::Camera {
   // Apply the rt_* settings on the live fds (called ONLY from the capture task).
   void apply_runtime_ctrls_();
   bool configure_capture_format_(uint32_t pixelformat);
+  bool configure_capture_framerate_();
   bool setup_capture_buffers_();
   bool setup_transform_();
   bool release_transform_();
@@ -226,9 +239,11 @@ class ESPVideoCamera : public camera::Camera {
   std::string resolution_{"auto"};
   int jpeg_quality_{10};
   uint16_t rotation_degrees_{0};
-  float max_framerate_{10.0f};
-  uint32_t min_interval_ms_{100};
+  std::atomic<float> max_framerate_{10.0f};
+  std::atomic<uint32_t> min_interval_ms_{100};
+  uint32_t native_capture_fps_{0};
   uint32_t last_frame_ms_{0};
+  std::atomic<bool> hardware_framerate_active_{false};
 
   // Consumers (bit masks indexed by camera::CameraRequester)
   std::vector<camera::CameraListener *> listeners_;
@@ -253,6 +268,10 @@ class ESPVideoCamera : public camera::Camera {
   int capture_fd_{-1};
   int jpeg_fd_{-1};
   bool streaming_{false};
+  bool capture_prepared_{false};
+  bool capture_streaming_{false};
+  bool jpeg_output_streaming_{false};
+  bool jpeg_capture_streaming_{false};
   uint32_t capture_width_{0};
   uint32_t capture_height_{0};
   uint32_t capture_stride_bytes_{0};
@@ -281,21 +300,33 @@ class ESPVideoCamera : public camera::Camera {
 
   // FORK: capture task + frame hand-off to loop().
   TaskHandle_t capture_task_{nullptr};
+  std::atomic<bool> capture_task_running_{false};
+  SemaphoreHandle_t capture_task_done_{nullptr};
+  StaticSemaphore_t capture_task_done_storage_{};
   SemaphoreHandle_t frame_mutex_{nullptr};
   uint8_t *pending_jpeg_{nullptr};  // finished PSRAM copy, waiting for loop()
   size_t pending_jpeg_len_{0};
+  uint8_t pending_requesters_{0};
   std::atomic<bool> capture_wanted_{false};
+  std::atomic<bool> capture_faulted_{false};
+  std::atomic<bool> capture_retry_requested_{false};
+  std::atomic<uint8_t> capture_retry_attempts_{0};
+  bool capture_linger_armed_{false};
+  bool capture_retry_armed_{false};
+  uint32_t last_alloc_warning_ms_{0};
   int dbg_frames_{0};  // DQBUF diagnostics: log only the first few frames
 
-  // FORK (black frames): warmup — the first N frames after the capture pipeline
-  // starts are dropped (AE/IPA needs ~10 frames to converge, otherwise an
-  // event-triggered snapshot comes out black). linger — the capture pipeline
-  // stays alive for another 5 s after the last request, so a burst of events is
-  // served by an already warm camera instead of restarting the pipeline.
-  int warmup_left_{0};          // capture task only
-  uint32_t idle_since_ms_{0};   // loop() only
-  static constexpr int WARMUP_FRAMES = 10;
+  // The hardware JPEG path discards the first two CSI buffers after STREAMON,
+  // matching Espressif's V4L2 examples. The independent raw path keeps its
+  // qualified time gate because hardware frame skipping changes DQBUF cadence.
+  uint8_t startup_frames_remaining_{0};
+  static constexpr uint8_t STARTUP_FRAME_COUNT = 2;
+  uint32_t raw_warmup_until_ms_{0};
+  static constexpr uint32_t RAW_WARMUP_MS = 250;
   static constexpr uint32_t LINGER_MS = 5000;
+  static constexpr uint32_t CAPTURE_RETRY_MS = 1000;
+  static constexpr uint8_t MAX_CAPTURE_RETRIES = 3;
+  static constexpr uint32_t CAPTURE_STOP_TIMEOUT_MS = 7000;
 
   // FORK: runtime settings (HA / web): -1 means unset.
   std::atomic<int> rt_exposure_{-1};  // V4L2_CID_EXPOSURE, 2-235 on the OV5647
