@@ -8,9 +8,11 @@
 
 #include "esp_heap_caps.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <new>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -42,18 +44,34 @@ static const char *const TAG = "esp_video_camera";
 // ===========================================================================
 namespace {
 
+// FORK: setup has a bounded wait, but esp_video_init() itself is not
+// cancellable. Keep the task's complete argument graph alive if it times out.
 struct VideoInitParams {
-  esp_video_init_config_t *config;
-  esp_err_t result;
-  SemaphoreHandle_t done;
+  esp_video_init_config_t config{};
+  esp_video_init_csi_config_t csi_config{};
+#if CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
+  esp_video_init_usb_uvc_config_t uvc_config{};
+#endif
+  esp_err_t result{ESP_FAIL};
+  SemaphoreHandle_t done{nullptr};
+  std::atomic<uint8_t> references{2};
 };
+
+void release_video_init_params(VideoInitParams *params) {
+  if (params == nullptr || params->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
+    return;
+  if (params->done != nullptr)
+    vSemaphoreDelete(params->done);
+  delete params;
+}
 
 // ESP32-P4 camera hardware must be initialised on core 0; run esp_video_init
 // there regardless of which core ESPHome runs on.
 void video_init_task_core0(void *param) {
   auto *p = static_cast<VideoInitParams *>(param);
-  p->result = esp_video_init(p->config);
+  p->result = esp_video_init(&p->config);
   xSemaphoreGive(p->done);
+  release_video_init_params(p);
   vTaskDelete(nullptr);
 }
 
@@ -310,27 +328,39 @@ bool ESPVideoCamera::init_pipeline_() {
   }
 #endif
 
-  // Run esp_video_init() on core 0 (hardware requirement).
-  SemaphoreHandle_t done = xSemaphoreCreateBinary();
-  if (done == nullptr)
+  // FORK: run esp_video_init() on core 0 (hardware requirement). The worker can
+  // legally outlive our bounded setup wait, so it owns a second reference to
+  // every config object and to the semaphore it will eventually signal.
+  auto *params = new (std::nothrow) VideoInitParams();
+  if (params == nullptr)
     return false;
-  VideoInitParams params = {};
-  params.config = &video_config;
-  params.done = done;
-  TaskHandle_t task = nullptr;
-  if (xTaskCreatePinnedToCore(video_init_task_core0, "esp_video_init", 8192, &params, 5, &task, 0) != pdPASS) {
-    vSemaphoreDelete(done);
+  params->done = xSemaphoreCreateBinary();
+  if (params->done == nullptr) {
+    params->references.store(1, std::memory_order_release);
+    release_video_init_params(params);
     return false;
   }
-  if (xSemaphoreTake(done, pdMS_TO_TICKS(10000)) != pdTRUE) {
+  params->config = video_config;
+  params->csi_config = csi_config;
+  params->config.csi = uvc_only ? nullptr : &params->csi_config;
+#if CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
+  params->uvc_config = uvc_config;
+  params->config.usb_uvc = this->enable_uvc_ ? &params->uvc_config : nullptr;
+#endif
+  if (xTaskCreatePinnedToCore(video_init_task_core0, "esp_video_init", 8192, params, 5, nullptr, 0) != pdPASS) {
+    params->references.store(1, std::memory_order_release);
+    release_video_init_params(params);
+    return false;
+  }
+  if (xSemaphoreTake(params->done, pdMS_TO_TICKS(10000)) != pdTRUE) {
     ESP_LOGE(TAG, "esp_video_init() timed out");
-    vSemaphoreDelete(done);
+    release_video_init_params(params);
     return false;
   }
-  vSemaphoreDelete(done);
-
-  if (params.result != ESP_OK) {
-    ESP_LOGE(TAG, "esp_video_init() failed: %s", esp_err_to_name(params.result));
+  const esp_err_t init_result = params->result;
+  release_video_init_params(params);
+  if (init_result != ESP_OK) {
+    ESP_LOGE(TAG, "esp_video_init() failed: %s", esp_err_to_name(init_result));
     return false;
   }
   this->pipeline_ready_ = true;
