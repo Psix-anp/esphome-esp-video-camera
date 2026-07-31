@@ -3,6 +3,17 @@
 All notable changes to this component are documented here. Version numbers refer
 to this repository, not to the upstream pull request.
 
+## Unreleased
+
+### Changed
+
+* Update to the official post-release `esp_video` 2.3.0 commit that accepts any
+  compatible `esp_h264` 1.3.x dependency.
+* Use the renamed 2.3.0 hardware JPEG encoder Kconfig symbols.
+* Keep direct JPEG/MJPEG builds free of the inactive `esp_h264` dependency
+  through an empty local component stub; raw CSI integrations still resolve the
+  real managed codec.
+
 ## v0.1.0 — 2026-07-27
 
 First published version. Baseline is the `esp_video_camera` component from

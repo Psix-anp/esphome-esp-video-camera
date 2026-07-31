@@ -23,10 +23,8 @@ port of [youkorr/esphome_esp-video](https://github.com/youkorr/esphome_esp-video
 That PR is still open and unmerged.
 
 This repository is that component **plus the fixes needed to make it actually
-run on real hardware** (Waveshare ESP32-P4 + OV5647). `__init__.py`,
-`i2c_helper.h` and `cfg/sc202cs.json` are unchanged from the PR; all changes are
-in `esp_video_camera.cpp` / `esp_video_camera.h` and are marked with `// FORK:`
-comments. See [`NOTICE`](NOTICE) for licensing and attribution.
+run on real hardware** (Waveshare ESP32-P4 + OV5647). The changes are documented
+below; see [`NOTICE`](NOTICE) for licensing and attribution.
 
 ---
 
@@ -127,7 +125,7 @@ pipeline. A burst of events is served by an already warm camera.
 
 * ESP32-P4 with a MIPI-CSI sensor supported by `esp_cam_sensor`
   (auto-detected: SC202CS, OV5647, SC2336), or a USB-UVC camera.
-* ESP-IDF **≥ 5.4** (required by `esp_video` 2.2.0).
+* ESP-IDF **≥ 5.4** (required by `esp_video` 2.3.0).
 * **The `esp-idf` toolchain — this is mandatory**, see below.
 
 ### `esp32: toolchain: esp-idf` is required
@@ -349,8 +347,8 @@ in your build directory for the exact symbols.
 * **Sensor:** OV5647 module on the 15-pin CSI connector
 * **ESPHome:** 2026.6.2 (with `esp32: toolchain: esp-idf`)
 * **ESP-IDF:** 5.5.4
-* **Managed components:** `espressif/esp_video` 2.2.0 (pulls `esp_cam_sensor`
-  2.2.x, `esp_ipa`, `esp_sccb_intf`, `esp_h264`)
+* **Hardware-qualified baseline:** `espressif/esp_video` 2.2.0 with
+  `esp_cam_sensor` 2.2.x and `esp_ipa` 2.1.x.
 
 Board-specific notes, which generalise reasonably well:
 
@@ -368,6 +366,12 @@ Verified working: sensor detected over SCCB, IPA tuning loaded, ISP streaming
 (AE converging), JPEG frames delivered over the ESPHome API (e.g. 800x800 →
 ~21.7 KB), camera entity visible in Home Assistant, no watchdog resets.
 
+The current dependency graph is compile-qualified with the official
+`esp_video` 2.3.0 follow-up at commit
+`50d258a34938014b5f43277573880d96bd8ed669`, `esp_cam_sensor` 2.3.x and
+`esp_ipa` 2.2.x. The immutable follow-up is used because it widens the release's
+exact `esp_h264` 1.3.0 manifest pin to the compatible 1.3.x series.
+
 ---
 
 ## Known limitations
@@ -379,9 +383,11 @@ Verified working: sensor detected over SCCB, IPA tuning loaded, ISP streaming
 * **The ESP32-P4 has a single hardware JPEG engine**, shared between encode and
   decode. If something else in your firmware decodes JPEG in hardware (an image
   component, a display pipeline), the two contend for the same device.
-* **JPEG only.** There is no H.264 path here, even though `esp_video` pulls
-  `esp_h264` in on the P4. Frames are JPEG because that is what the Home
-  Assistant camera API expects.
+* **JPEG/MJPEG output only.** There is no H.264 path in this camera component.
+  Direct JPEG/MJPEG builds satisfy esp_video's inactive H.264 manifest edge
+  with an empty local component, so `esp_h264` is neither downloaded nor
+  compiled. Raw CSI integrations do not install that stub and can resolve the
+  real codec from their separate encoder component.
 * **`resolution:` cannot conjure modes** the sensor driver was not compiled with
   — see "Sensor modes".
 * **Only three MIPI sensors are auto-detected** (SC202CS, OV5647, SC2336); that
