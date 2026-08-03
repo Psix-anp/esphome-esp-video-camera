@@ -5,6 +5,14 @@ to this repository, not to the upstream pull request.
 
 ## Unreleased
 
+### Added
+
+* Synchronous borrowed-frame consumers for native RGB565 CSI frames and encoded
+  JPEG frames. Consumers can start and stop capture independently from Home
+  Assistant camera requesters without opening the sensor a second time.
+* `device: csi` now operates as a raw-consumer-only pipeline and bypasses the
+  hardware JPEG encoder.
+
 ### Changed
 
 * Update to the official post-release `esp_video` 2.3.0 commit that accepts any
