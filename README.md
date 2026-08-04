@@ -190,6 +190,7 @@ esp_video_camera:
   device: jpeg        # hardware JPEG encoder (/dev/video10) — MIPI-CSI sensors
   resolution: "auto"  # "auto" = the sensor's native/default mode
   jpeg_quality: 10    # 1..63
+  rotation: 0         # 0/90/180/270 degrees clockwise, hardware PPA
   max_framerate: 10
   enable_xclk: false  # true only if the sensor needs an XCLK from the MCU
 ```
@@ -202,7 +203,8 @@ esp_video_camera:
 | `device` | `jpeg` | `jpeg` = MIPI-CSI + hardware JPEG (`/dev/video10`); `csi` = raw CSI device; `uvc` / `uvc0`..`uvc9` = USB-UVC; or an explicit `/dev/videoN`. |
 | `resolution` | `auto` | `auto`, an alias (`QVGA`/`VGA`/`480P`/`720P`/`1080P`) or `WIDTHxHEIGHT`. Best-effort: the sensor must actually support the mode, see "Sensor modes". |
 | `jpeg_quality` | `10` | 1..63 (`V4L2_CID_JPEG_COMPRESSION_QUALITY`). |
-| `max_framerate` | `10` | Throttle applied when publishing frames. |
+| `rotation` | `0` | `0`, `90`, `180` or `270` degrees clockwise. Hardware PPA; MIPI-CSI JPEG path only. |
+| `max_framerate` | `10` | Throttle for ESPHome camera API frames. Borrowed consumers receive the sensor frame rate. |
 | `enable_xclk` | `false` | Generate the sensor XCLK with LEDC before init. Not needed for modules with their own crystal. |
 | `xclk_pin` | `36` | Only used when `enable_xclk: true`. |
 | `xclk_frequency` | `24000000` | Only used when `enable_xclk: true`. |
@@ -210,6 +212,12 @@ esp_video_camera:
 
 `reset_pin` / `pwdn_pin` are hardcoded to `-1`; boards that need a reset are
 expected to hold it via hardware (e.g. a pull-up on the CSI connector).
+
+When a sensor coerces an explicit `resolution:` to a larger native mode, the
+same PPA transaction can downscale before JPEG encoding if the ratio is exactly
+representable at the hardware's 1/16 scale precision. Otherwise the negotiated
+sensor size is retained and a warning is logged. Rotation and downscaling stay
+in RGB565 and do not add a software decode/re-encode step.
 
 ---
 
@@ -358,6 +366,16 @@ are borrowed and valid **only for the duration of the callback**. A consumer
 must copy the payload before returning if it needs to retain or queue the frame,
 and should keep callback work bounded so the V4L2 buffer can be re-queued
 promptly.
+
+`stop_raw_frame_consumer()` and `stop_jpeg_frame_consumer()` prevent future
+callback delivery but do not wait for a callback already running on the capture
+task. The consumer object and any callback-owned state must remain valid until
+that in-flight callback has returned.
+
+`max_framerate` throttles only frames copied to the ESPHome camera API. Borrowed
+consumers receive every sensor frame. A JPEG consumer therefore keeps the
+hardware encoder running at the sensor rate even when no Home Assistant camera
+listener is active.
 
 Registration and activation are separate: register a stable consumer object
 once, then use `start_raw_frame_consumer()` / `stop_raw_frame_consumer()` or
