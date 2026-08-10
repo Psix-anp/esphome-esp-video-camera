@@ -22,15 +22,21 @@
 
 namespace esphome::esp_video_camera {
 
-/// FORK: A borrowed native RGB565_LE frame produced by the camera's ISP path.
+enum class RawVideoPixelFormat : uint8_t {
+  RGB565_LE,
+  YUV420_OUYY_EVYY,
+};
+
+/// A borrowed native frame produced by the camera's ISP path.
 ///
 /// ESPVideoCamera owns the storage. It remains valid only for the synchronous
 /// consume_raw_video_frame() call and must not be retained by the consumer.
-/// Consumers that need asynchronous processing must copy the payload before
-/// returning.
+/// rotation_degrees describes the configured clockwise display orientation;
+/// encoded consumers apply it independently from the camera JPEG transform.
 struct RawVideoFrame {
   const uint8_t *data{nullptr};
   size_t size{0};
+  RawVideoPixelFormat pixel_format{RawVideoPixelFormat::RGB565_LE};
   uint16_t width{0};
   uint16_t height{0};
   uint16_t stride_bytes{0};
@@ -38,6 +44,12 @@ struct RawVideoFrame {
   uint16_t rotation_degrees{0};
 };
 
+/// Optional hardware-media tap for the native camera pipeline.
+///
+/// The consumer is registered once during setup and can independently enable
+/// or disable delivery. This keeps capture ownership in ESPVideoCamera while a
+/// codec adapter borrows the native ISP frame before camera-specific JPEG
+/// rotation/scaling.
 class RawVideoFrameConsumer {
  public:
   virtual ~RawVideoFrameConsumer() = default;
@@ -47,8 +59,9 @@ class RawVideoFrameConsumer {
 /// A borrowed JPEG access unit produced by the camera hardware.
 ///
 /// ESPVideoCamera retains the V4L2 buffer. The payload is valid only for the
-/// synchronous consume_jpeg_frame() call. Consumers that retain or queue a
-/// frame must copy it before returning.
+/// synchronous consume_jpeg_frame() call, allowing realtime consumers to copy
+/// it directly into their own bounded queue without a PSRAM allocation or a
+/// trip through the ESPHome main loop.
 struct JpegFrame {
   const uint8_t *data{nullptr};
   size_t size{0};
@@ -100,7 +113,7 @@ class ESPVideoCameraImageReader : public camera::CameraImageReader {
 /// This single component both initialises the camera pipeline (MIPI-CSI, with an
 /// optional USB-UVC host) and publishes the stream as a native `camera` entity.
 /// It captures JPEG/MJPEG frames from a V4L2 device:
-///   - "jpeg": the hardware JPEG encoder (/dev/video10) — works with every
+///   - "jpeg": the hardware JPEG encoder (/dev/video10), compatible with every
 ///     auto-detected MIPI-CSI sensor (SC202CS, OV5647, SC2336, ...).
 ///   - "uvc":  a USB-UVC camera (/dev/video40+) that streams MJPEG.
 ///   - "/dev/videoN": an explicit V4L2 path.
@@ -131,10 +144,9 @@ class ESPVideoCamera : public camera::Camera {
         std::memory_order_release);
   }
 
-  // FORK: runtime settings coming from Home Assistant / the web server. The
-  // values live in atomic fields and are applied by the CAPTURE TASK
-  // (apply_runtime_ctrls_) on the live file descriptors — no ioctl is ever
-  // issued from a foreign thread. -1 means "unset" (driver default / auto).
+  // Runtime settings from HA/web are stored atomically and applied by the
+  // capture task on live descriptors. Never issue these ioctls from another
+  // thread. A value of -1 leaves the driver default/automatic mode unchanged.
   void set_runtime_exposure(int v) {
     this->rt_exposure_.store(v);
     this->ctrls_dirty_.store(true);
@@ -156,6 +168,9 @@ class ESPVideoCamera : public camera::Camera {
     this->min_interval_ms_.store(
         (fps > 0.0f) ? (uint32_t) (1000.0f / fps) : 0,
         std::memory_order_release);
+    // Runtime changes cannot reprogram an already-streaming CSI device here.
+    // Use the frame-driven gate for the current session; resume_capture_()
+    // reapplies S_PARM before the next STREAMON without reallocating buffers.
     this->hardware_framerate_active_.store(false,
                                            std::memory_order_release);
   }
@@ -167,10 +182,8 @@ class ESPVideoCamera : public camera::Camera {
   void start_stream(camera::CameraRequester requester) override;
   void stop_stream(camera::CameraRequester requester) override;
 
-  // FORK: optional synchronous taps share the component-owned V4L2 queues.
-  // A stop call prevents future delivery but is not a barrier for a callback
-  // already running on the capture task.
-  bool register_raw_frame_consumer(RawVideoFrameConsumer *consumer);
+  bool register_raw_frame_consumer(RawVideoFrameConsumer *consumer,
+                                   RawVideoPixelFormat pixel_format);
   bool start_raw_frame_consumer(RawVideoFrameConsumer *consumer);
   void stop_raw_frame_consumer(RawVideoFrameConsumer *consumer);
   bool register_jpeg_frame_consumer(JpegFrameConsumer *consumer);
@@ -187,36 +200,32 @@ class ESPVideoCamera : public camera::Camera {
   void schedule_capture_retry_();
   bool has_consumers_() const;
 
-  // FORK: capture moved out of loop() into a dedicated FreeRTOS task. The
-  // blocking DQBUF ioctls stalled loopTask for >5 s → task_wdt → reboot
-  // (a crash loop, because Home Assistant polls the camera entity on its own).
-  // Same pattern as the core esp32_camera component: the task captures and
-  // parks the finished JPEG in pending_jpeg_ (under a mutex); loop() only
-  // picks it up and hands it to the listeners (the API is not thread-safe).
+  // Capture runs in a dedicated FreeRTOS task because blocking DQBUF calls
+  // previously stalled loopTask for more than five seconds and tripped
+  // task_wdt. As in core esp32_camera, the task puts a completed JPEG into a
+  // mutex-protected pending slot and loop() alone notifies API listeners.
   static void capture_task_trampoline(void *param);
   void capture_task_run_();
-  // From the task: copy the finished JPEG into PSRAM and park it in the slot.
+  // Copy a completed JPEG to PSRAM and publish it to the pending slot.
   void queue_frame_(const uint8_t *data, size_t length);
-  // From loop(): hand the copy to the listeners (ownership moves to the image).
+  // Deliver from loop(); CameraImage takes ownership of the allocation.
   void deliver_frame_owned_(uint8_t *data, size_t length,
                             uint8_t requesters);
-  // FORK: one-shot enumeration of the sensor/ISP V4L2 controls into the log —
-  // shows what the hardware actually supports (flip/brightness/exposure/...)
-  // so that runtime settings can be wired up against real controls.
-  void log_sensor_controls_();
-  // Apply the rt_* settings on the live fds (called ONLY from the capture task).
+  // Apply rt_* settings to live descriptors from the capture task only.
   void apply_runtime_ctrls_();
   bool configure_capture_format_(uint32_t pixelformat);
   bool configure_capture_framerate_();
   bool setup_capture_buffers_();
-  bool setup_transform_();
-  bool release_transform_();
+  bool setup_rotation_();
+  bool release_rotation_();
   // Hardware-JPEG path: capture RGB565 (sensor/ISP) -> JPEG M2M encoder.
   bool start_jpeg_pipeline_();
   void loop_jpeg_pipeline_();
-  void deliver_raw_frame_(const uint8_t *data, size_t size, uint16_t width,
+  void deliver_raw_frame_(const uint8_t *data, size_t size,
+                          RawVideoPixelFormat pixel_format, uint16_t width,
                           uint16_t height, uint16_t stride_bytes,
-                          uint32_t timestamp_90khz);
+                          uint32_t timestamp_90khz,
+                          uint16_t rotation_degrees);
   void deliver_jpeg_frame_(const uint8_t *data, size_t size,
                            uint32_t timestamp_90khz);
   // Direct path: a source that already delivers JPEG/MJPEG (USB-UVC / device).
@@ -248,13 +257,28 @@ class ESPVideoCamera : public camera::Camera {
   // Consumers (bit masks indexed by camera::CameraRequester)
   std::vector<camera::CameraListener *> listeners_;
   std::shared_ptr<ESPVideoCameraImage> current_image_;
+  // Camera API callbacks run on the ESPHome loop while the capture task reads
+  // these masks to decide whether hardware JPEG output is needed. Keep the
+  // cross-task ownership explicit instead of relying on byte-sized accesses
+  // being incidentally atomic on the P4.
   std::atomic<uint8_t> stream_requesters_{0};
   std::atomic<uint8_t> single_requesters_{0};
-  // FORK: cross-task borrowed-frame consumers.
   std::atomic<RawVideoFrameConsumer *> raw_frame_consumer_{nullptr};
+  std::atomic<RawVideoPixelFormat> raw_frame_pixel_format_{
+      RawVideoPixelFormat::RGB565_LE};
   std::atomic<bool> raw_frame_consumer_active_{false};
   std::atomic<JpegFrameConsumer *> jpeg_frame_consumer_{nullptr};
   std::atomic<bool> jpeg_frame_consumer_active_{false};
+#ifdef USE_ESPHOME_VOIP_STACK_VIDEO_DEBUG
+  std::atomic<uint32_t> jpeg_debug_generation_{0};
+  uint32_t jpeg_debug_observed_generation_{0};
+  uint32_t jpeg_debug_frames_{0};
+  uint64_t jpeg_debug_ppa_total_us_{0};
+  uint64_t jpeg_debug_encode_total_us_{0};
+  uint32_t jpeg_debug_ppa_max_us_{0};
+  uint32_t jpeg_debug_encode_max_us_{0};
+  uint32_t jpeg_debug_last_log_ms_{0};
+#endif
 
   // V4L2 state.
   //
@@ -268,13 +292,23 @@ class ESPVideoCamera : public camera::Camera {
   int capture_fd_{-1};
   int jpeg_fd_{-1};
   bool streaming_{false};
-  bool capture_prepared_{false};
+  // Track each V4L2 queue independently. A failed STREAMOFF must retain every
+  // DMA-visible mapping until a later bounded recovery attempt confirms that
+  // all queues stopped.
   bool capture_streaming_{false};
   bool jpeg_output_streaming_{false};
   bool jpeg_capture_streaming_{false};
+  // V4L2 queue memory is prepared once and reused with STREAMON/STREAMOFF.
+  // This follows Espressif's own repeated-stream test and lets the capture
+  // task sleep indefinitely without freeing/reallocating large DMA extents.
+  bool capture_prepared_{false};
+  std::atomic<bool> capture_faulted_{false};
   uint32_t capture_width_{0};
   uint32_t capture_height_{0};
   uint32_t capture_stride_bytes_{0};
+  size_t capture_frame_bytes_{0};
+  RawVideoPixelFormat capture_pixel_format_{
+      RawVideoPixelFormat::RGB565_LE};
   uint32_t jpeg_width_{0};
   uint32_t jpeg_height_{0};
   static constexpr int MAX_BUFFERS = 3;
@@ -286,50 +320,63 @@ class ESPVideoCamera : public camera::Camera {
   int num_capture_buffers_{0};
   MappedBuffer jpeg_out_buffer_;
 
-  // FORK: optional producer-side PPA transform for the hardware JPEG path.
-  // One SRM transaction rotates and, when the sensor coerces a requested
-  // resolution upward, downscales the RGB565 frame before JPEG encoding.
+  // Optional producer-side PPA transform for the hardware JPEG path. The same
+  // SRM transaction performs rotation and, when the sensor coerces a requested
+  // smaller resolution upward, downscaling. A single RGB565 buffer is
+  // sufficient because the capture task waits for JPEG OUTPUT DQBUF before
+  // submitting the next frame.
   ppa_client_handle_t ppa_srm_{nullptr};
   bool ppa_transform_required_{false};
   float ppa_scale_x_{1.0f};
   float ppa_scale_y_{1.0f};
-  uint8_t *transformed_rgb565_{nullptr};
-  size_t transformed_rgb565_bytes_{0};
-  size_t transformed_rgb565_alloc_size_{0};
-  size_t transformed_rgb565_capacity_{0};
+  uint8_t *rotated_rgb565_{nullptr};
+  size_t rotated_rgb565_bytes_{0};
+  size_t rotated_rgb565_alloc_size_{0};
+  // The P4 display/video stack owns several large PSRAM blocks. Reallocating
+  // this contiguous DMA buffer for every short camera session eventually
+  // fragments PSRAM even when the total free size remains ample. Retain the
+  // largest successful allocation for the component lifetime and only
+  // register/unregister the PPA client per capture session.
+  size_t rotated_rgb565_capacity_{0};
 
-  // FORK: capture task + frame hand-off to loop().
+  // Capture task and its single-slot handoff to loop().
   TaskHandle_t capture_task_{nullptr};
   std::atomic<bool> capture_task_running_{false};
   SemaphoreHandle_t capture_task_done_{nullptr};
   StaticSemaphore_t capture_task_done_storage_{};
   SemaphoreHandle_t frame_mutex_{nullptr};
-  uint8_t *pending_jpeg_{nullptr};  // finished PSRAM copy, waiting for loop()
+  // Ownership passes to CameraImage when loop() removes this pointer. That
+  // contract prevents safe reuse without changing ESPHome's camera API.
+  uint8_t *pending_jpeg_{nullptr};
   size_t pending_jpeg_len_{0};
   uint8_t pending_requesters_{0};
   std::atomic<bool> capture_wanted_{false};
-  std::atomic<bool> capture_faulted_{false};
   std::atomic<bool> capture_retry_requested_{false};
   std::atomic<uint8_t> capture_retry_attempts_{0};
+  // Main-loop-owned guard for the one-shot linger timeout. Ready frames may
+  // wake loop() while the camera is lingering; they must not postpone the
+  // original shutdown deadline by re-arming the timeout every frame.
   bool capture_linger_armed_{false};
   bool capture_retry_armed_{false};
   uint32_t last_alloc_warning_ms_{0};
-  int dbg_frames_{0};  // DQBUF diagnostics: log only the first few frames
 
-  // The hardware JPEG path discards the first two CSI buffers after STREAMON,
-  // matching Espressif's V4L2 examples. The independent raw path keeps its
-  // qualified time gate because hardware frame skipping changes DQBUF cadence.
-  uint8_t startup_frames_remaining_{0};
+  // Espressif's V4L2 examples dequeue and requeue the first two CSI buffers
+  // after every STREAMON. Apply that event-driven warmup to the hardware JPEG
+  // path so its first published frame already has stable ISP color.
+  uint8_t startup_frames_remaining_{0};  // capture task only
   static constexpr uint8_t STARTUP_FRAME_COUNT = 2;
-  uint32_t raw_warmup_until_ms_{0};
+  // Preserve the qualified time gate for the independent raw H.264 path.
+  uint32_t raw_warmup_until_ms_{0};  // capture task only
   static constexpr uint32_t RAW_WARMUP_MS = 250;
+  // Linger keeps capture warm for five seconds after the last request so a
+  // short burst of related events avoids pipeline churn.
   static constexpr uint32_t LINGER_MS = 5000;
   static constexpr uint32_t CAPTURE_RETRY_MS = 1000;
   static constexpr uint8_t MAX_CAPTURE_RETRIES = 3;
-  static constexpr uint32_t CAPTURE_STOP_TIMEOUT_MS = 7000;
+  static constexpr uint32_t CAPTURE_STOP_TIMEOUT_MS = 3000;
 
-  // FORK: runtime settings (HA / web): -1 means unset.
-  std::atomic<int> rt_exposure_{-1};  // V4L2_CID_EXPOSURE, 2-235 on the OV5647
+  // Runtime HA/web controls; -1 means unspecified.
+  std::atomic<int> rt_exposure_{-1};  // V4L2_CID_EXPOSURE, 2-235 on OV5647
   std::atomic<int> rt_vflip_{-1};    // V4L2_CID_VFLIP 0/1
   std::atomic<int> rt_hflip_{-1};    // V4L2_CID_HFLIP 0/1
   std::atomic<int> rt_quality_{-1};  // V4L2_CID_JPEG_COMPRESSION_QUALITY 1-63
