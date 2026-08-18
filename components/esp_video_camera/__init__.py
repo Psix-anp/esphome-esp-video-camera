@@ -4,8 +4,8 @@ Publishes the Espressif esp_video (V4L2) stream to Home Assistant as a native
 ``camera`` entity. Works with any auto-detected MIPI-CSI sensor through the
 hardware JPEG encoder, and with USB-UVC cameras.
 
-All Espressif sources are pulled through the IDF component manager (managed
-components) — nothing is vendored.
+All Espressif sources are pulled through the IDF component manager as managed
+components. Nothing is vendored.
 """
 
 from pathlib import Path
@@ -33,8 +33,12 @@ DEPENDENCIES = ["esp32", "i2c"]
 AUTO_LOAD = ["camera"]
 
 esp_video_camera_ns = cg.esphome_ns.namespace("esp_video_camera")
-Camera = cg.esphome_ns.namespace("camera").class_("Camera", cg.EntityBase, cg.Component)
-ESPVideoCamera = esp_video_camera_ns.class_("ESPVideoCamera", Camera)
+Camera = cg.esphome_ns.namespace("camera").class_(
+    "Camera", cg.EntityBase, cg.Component
+)
+ESPVideoCamera = esp_video_camera_ns.class_(
+    "ESPVideoCamera", Camera
+)
 
 CONF_JPEG_QUALITY = "jpeg_quality"
 CONF_MAX_FRAMERATE = "max_framerate"
@@ -85,11 +89,12 @@ def _validate_rotation(value):
 def _validate_config(config):
     if config[CONF_ROTATION] != 0 and config[CONF_DEVICE] not in (
         "jpeg",
+        "csi",
         "/dev/video10",
     ):
         raise cv.Invalid(
-            "rotation is supported only by the MIPI-CSI hardware JPEG path "
-            "(device: jpeg). An already-compressed MJPEG/UVC frame cannot be "
+            "rotation is supported only by a MIPI-CSI path (device: jpeg or "
+            "device: csi). An already-compressed MJPEG/UVC frame cannot be "
             "rotated without decoding and re-encoding it."
         )
     return config
@@ -154,37 +159,38 @@ async def to_code(config):
     cg.add(var.set_max_framerate(config[CONF_MAX_FRAMERATE]))
     cg.add(var.set_rotation(config[CONF_ROTATION]))
 
-    # Use the immutable official follow-up to esp_video 2.3.0. The registry
-    # release pins esp_h264 to 1.3.0 exactly; this commit widens that manifest
-    # edge to 1.3.* so esp_video can coexist with another component selecting a
-    # newer compatible 1.3.x codec.
+    # Managed Espressif components (no vendored sources). Espressif's esp_video
+    # (V4L2) framework transitively pulls the rest of the camera stack at
+    # compatible versions: esp_cam_sensor (MIPI sensor drivers), esp_sccb_intf
+    # (camera I2C/SCCB) and esp_ipa (ISP/IPA tuning).
     jpeg_enabled = config[CONF_DEVICE] in ("jpeg", "/dev/video10")
-    raw_csi_enabled = config[CONF_DEVICE] in ("csi", "/dev/video0")
+    # Pin the Espressif follow-up to esp_video 2.3.0 that widens its esp_h264
+    # dependency to 1.3.*. Both codec profiles then use the same V4L2 camera,
+    # ISP and sensor fixes while the generated build directories keep their
+    # compile-time codec graphs isolated.
     add_idf_component(
         name="espressif/esp_video",
         repo="https://github.com/espressif/esp-video-components.git",
         ref="50d258a34938014b5f43277573880d96bd8ed669",
         path="esp_video",
     )
-    if not raw_csi_enabled:
-        # esp_video declares esp_h264 for every ESP32-P4 in its manifest, while
-        # its source and CMake dependency are correctly gated by the disabled
-        # H.264 Kconfig symbol. Satisfy that inactive manifest edge for direct
-        # JPEG/MJPEG devices without downloading or compiling the codec. A raw
-        # CSI source remains available to separate encoder integrations.
+    if jpeg_enabled:
+        # esp_video 2.3.0's manifest pulls esp_h264 on every P4 build although
+        # both its H.264 source and CMake requirement are correctly Kconfig
+        # gated. IDF local-component precedence supplies an empty dependency
+        # only for JPEG firmware; H.264 profiles resolve the real library.
         add_extra_build_file(
             "components/esp_h264/CMakeLists.txt",
-            Path(__file__).parent / "build_stubs" / "esp_h264" / "CMakeLists.txt",
-        )
-        add_extra_build_file(
-            "components/esp_h264/idf_component.yml",
-            Path(__file__).parent / "build_stubs" / "esp_h264" / "idf_component.yml",
+            Path(__file__).parent
+            / "build_stubs"
+            / "esp_h264"
+            / "CMakeLists.txt",
         )
     if config[CONF_ENABLE_UVC]:
-        # USB-UVC host driver, aligned with esp_video 2.3.0's own dependency.
+        # USB-UVC host driver, aligned with esp_video 2.x's own dependency.
         add_idf_component(name="espressif/usb_host_uvc", ref="2.5.*")
 
-    # Pipeline features. JPEG encoder symbols were renamed in esp_video 2.3.0.
+    # Pipeline features. Kconfig keys verified against esp_video 2.3.
     # ENABLE_ISP_PIPELINE_CONTROLLER (default n) is what pulls in esp_ipa and
     # runs the AWB/AE/CCM/gamma automation that applies the sensor IPA JSON
     # tuning; without it the MIPI image is unprocessed (washed-out / green cast).
@@ -195,16 +201,27 @@ async def to_code(config):
         "CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER",
     ):
         add_idf_sdkconfig_option(opt, True)
-    if jpeg_enabled:
-        add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_JPEG_ENC_VIDEO_DEVICE", True)
-        add_idf_sdkconfig_option(
-            "CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_ENC_VIDEO_DEVICE", True
-        )
+    add_idf_sdkconfig_option(
+        "CONFIG_ESP_VIDEO_ENABLE_JPEG_ENC_VIDEO_DEVICE", jpeg_enabled
+    )
+    add_idf_sdkconfig_option(
+        "CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_ENC_VIDEO_DEVICE", jpeg_enabled
+    )
+
+    # esp_video's prebuilt IPA libraries emit per-frame DEBUG telemetry. Runtime
+    # tag filtering is disabled by ESPHome's size-oriented IDF defaults, making
+    # esp_log_level_set() a no-op. Use the lower-memory linked-list backend so
+    # this component can suppress only those hot tags while retaining normal
+    # application logging.
+    add_idf_sdkconfig_option("CONFIG_LOG_DYNAMIC_LEVEL_CONTROL", True)
+    add_idf_sdkconfig_option("CONFIG_LOG_TAG_LEVEL_IMPL_NONE", False)
+    add_idf_sdkconfig_option("CONFIG_LOG_TAG_LEVEL_IMPL_LINKED_LIST", True)
+
     if config[CONF_ENABLE_UVC]:
         add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE", True)
 
     # Auto-detect the MIPI-CSI sensors shipped with espressif/esp_cam_sensor over
-    # the shared I2C bus. Kconfig keys verified against esp_cam_sensor 2.3.x.
+    # the shared I2C bus. Kconfig keys verified against esp_cam_sensor 2.2.0.
     for sensor in ("SC202CS", "OV5647", "SC2336"):
         add_idf_sdkconfig_option(f"CONFIG_CAMERA_{sensor}", True)
         add_idf_sdkconfig_option(
