@@ -1494,7 +1494,7 @@ bool ESPVideoCamera::release_rotation_() {
 bool ESPVideoCamera::setup_capture_buffers_() {
   struct v4l2_requestbuffers req;
   memset(&req, 0, sizeof(req));
-  req.count = MAX_BUFFERS;
+  req.count = this->buffer_count_;
   req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   req.memory = V4L2_MEMORY_MMAP;
   if (ioctl(this->capture_fd_, VIDIOC_REQBUFS, &req) < 0) {
@@ -1936,6 +1936,8 @@ void ESPVideoCamera::dump_config() {
   }
   ESP_LOGCONFIG(TAG, "  Max framerate: %.1f fps",
                 this->max_framerate_.load(std::memory_order_acquire));
+  ESP_LOGCONFIG(TAG, "  Capture buffers: %u",
+                static_cast<unsigned>(this->buffer_count_));
   if (this->is_failed()) {
     ESP_LOGCONFIG(TAG, "  State: FAILED");
   }

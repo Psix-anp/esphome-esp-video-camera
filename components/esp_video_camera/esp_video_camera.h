@@ -131,6 +131,7 @@ class ESPVideoCamera : public camera::Camera {
   void set_xclk_freq(uint32_t freq) { this->xclk_freq_ = freq; }
   void set_enable_xclk_init(bool enable) { this->enable_xclk_init_ = enable; }
   void set_enable_uvc(bool enable) { this->enable_uvc_ = enable; }
+  void set_buffer_count(uint8_t count) { this->buffer_count_ = count; }
 
   // Camera platform configuration ----------------------------------------------
   void set_device(const std::string &device) { this->device_ = device; }
@@ -312,6 +313,7 @@ class ESPVideoCamera : public camera::Camera {
   uint32_t jpeg_width_{0};
   uint32_t jpeg_height_{0};
   static constexpr int MAX_BUFFERS = 3;
+  uint8_t buffer_count_{MAX_BUFFERS};
   struct MappedBuffer {
     void *start{nullptr};
     size_t length{0};

@@ -194,6 +194,7 @@ esp_video_camera:
   jpeg_quality: 10    # 1..63
   rotation: 0         # 0/90/180/270 degrees clockwise, hardware PPA
   max_framerate: 10
+  buffer_count: 3     # 2 or 3 queued V4L2 capture buffers
   enable_xclk: false  # true only if the sensor needs an XCLK from the MCU
 ```
 
@@ -207,6 +208,7 @@ esp_video_camera:
 | `jpeg_quality` | `10` | 1..63 (`V4L2_CID_JPEG_COMPRESSION_QUALITY`). |
 | `rotation` | `0` | `0`, `90`, `180` or `270` degrees clockwise. Hardware PPA; MIPI-CSI JPEG path only. |
 | `max_framerate` | `10` | Programs V4L2 frame skipping when supported. If the source cannot apply it, ESPHome API frames use a software throttle while borrowed consumers retain the sensor frame rate. |
+| `buffer_count` | `3` | Number of queued V4L2 capture buffers. Use `2` to reduce capture memory while retaining double buffering. |
 | `enable_xclk` | `false` | Generate the sensor XCLK with LEDC before init. Not needed for modules with their own crystal. |
 | `xclk_pin` | `36` | Only used when `enable_xclk: true`. |
 | `xclk_frequency` | `24000000` | Only used when `enable_xclk: true`. |
