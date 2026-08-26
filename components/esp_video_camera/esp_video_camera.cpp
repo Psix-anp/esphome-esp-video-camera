@@ -943,8 +943,9 @@ void ESPVideoCamera::loop_jpeg_pipeline_() {
     return;
   }
 
-  // esp_video 2.3.0 triggers lazy M2M processing from CAPTURE DQBUF. OUTPUT
-  // DQBUF must follow it; reversing this order blocks forever on ready_sem.
+  // esp_video 2.3.0 and later trigger lazy M2M processing from CAPTURE DQBUF.
+  // OUTPUT DQBUF must follow it; reversing this order blocks forever on
+  // ready_sem.
   memset(&jpeg_buf, 0, sizeof(jpeg_buf));
   jpeg_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   jpeg_buf.memory = V4L2_MEMORY_MMAP;
