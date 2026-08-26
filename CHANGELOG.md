@@ -19,8 +19,8 @@ to this repository, not to the upstream pull request.
 
 ### Changed
 
-* Update to the official post-release `esp_video` 2.3.0 commit that accepts any
-  compatible `esp_h264` 1.3.x dependency.
+* Update to the published `esp_video` 2.4.1 component, with `esp_cam_sensor`
+  2.4.x, `esp_ipa` 2.3.x and compatible `esp_h264` 1.3.x dependencies.
 * Use the renamed 2.3.0 hardware JPEG encoder Kconfig symbols.
 * Keep direct JPEG/MJPEG builds free of the inactive `esp_h264` dependency
   through an empty local component stub; raw CSI integrations still resolve the

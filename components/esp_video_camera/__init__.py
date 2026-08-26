@@ -164,18 +164,11 @@ async def to_code(config):
     # compatible versions: esp_cam_sensor (MIPI sensor drivers), esp_sccb_intf
     # (camera I2C/SCCB) and esp_ipa (ISP/IPA tuning).
     jpeg_enabled = config[CONF_DEVICE] in ("jpeg", "/dev/video10")
-    # Pin the Espressif follow-up to esp_video 2.3.0 that widens its esp_h264
-    # dependency to 1.3.*. Both codec profiles then use the same V4L2 camera,
-    # ISP and sensor fixes while the generated build directories keep their
-    # compile-time codec graphs isolated.
-    add_idf_component(
-        name="espressif/esp_video",
-        repo="https://github.com/espressif/esp-video-components.git",
-        ref="50d258a34938014b5f43277573880d96bd8ed669",
-        path="esp_video",
-    )
+    # Use the published component so its compatible esp_cam_sensor, esp_ipa
+    # and esp_h264 dependencies are resolved by the IDF component manager.
+    add_idf_component(name="espressif/esp_video", ref="2.4.1")
     if jpeg_enabled:
-        # esp_video 2.3.0's manifest pulls esp_h264 on every P4 build although
+        # esp_video's manifest pulls esp_h264 on every P4 build although
         # both its H.264 source and CMake requirement are correctly Kconfig
         # gated. IDF local-component precedence supplies an empty dependency
         # only for JPEG firmware; H.264 profiles resolve the real library.
@@ -190,7 +183,7 @@ async def to_code(config):
         # USB-UVC host driver, aligned with esp_video 2.x's own dependency.
         add_idf_component(name="espressif/usb_host_uvc", ref="2.5.*")
 
-    # Pipeline features. Kconfig keys verified against esp_video 2.3.
+    # Pipeline features. Kconfig keys verified against esp_video 2.4.
     # ENABLE_ISP_PIPELINE_CONTROLLER (default n) is what pulls in esp_ipa and
     # runs the AWB/AE/CCM/gamma automation that applies the sensor IPA JSON
     # tuning; without it the MIPI image is unprocessed (washed-out / green cast).
@@ -221,7 +214,7 @@ async def to_code(config):
         add_idf_sdkconfig_option("CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE", True)
 
     # Auto-detect the MIPI-CSI sensors shipped with espressif/esp_cam_sensor over
-    # the shared I2C bus. Kconfig keys verified against esp_cam_sensor 2.2.0.
+    # the shared I2C bus. Kconfig keys verified against esp_cam_sensor 2.4.
     for sensor in ("SC202CS", "OV5647", "SC2336"):
         add_idf_sdkconfig_option(f"CONFIG_CAMERA_{sensor}", True)
         add_idf_sdkconfig_option(
