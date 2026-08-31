@@ -46,6 +46,7 @@ CONF_XCLK_PIN = "xclk_pin"
 CONF_XCLK_FREQUENCY = "xclk_frequency"
 CONF_ENABLE_XCLK = "enable_xclk"
 CONF_ENABLE_UVC = "enable_uvc"
+CONF_BUFFER_COUNT = "buffer_count"
 
 _RESOLUTION_ALIASES = ("QVGA", "VGA", "480P", "720P", "1080P")
 _ROTATIONS = {0: 0, 90: 90, 180: 180, 270: 270}
@@ -124,6 +125,11 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_ENABLE_XCLK, default=False): cv.boolean,
             cv.Optional(CONF_ENABLE_UVC, default=False): cv.boolean,
+            # Espressif's capture_stream example uses two queued buffers and
+            # the driver requires more than one. Keep three as the compatible
+            # default while allowing memory-constrained concurrent pipelines
+            # to select the standard double-buffered configuration.
+            cv.Optional(CONF_BUFFER_COUNT, default=3): cv.int_range(min=2, max=3),
         }
     )
     .extend(cv.ENTITY_BASE_SCHEMA)
@@ -152,6 +158,7 @@ async def to_code(config):
     cg.add(var.set_xclk_freq(config[CONF_XCLK_FREQUENCY]))
     cg.add(var.set_enable_xclk_init(config[CONF_ENABLE_XCLK]))
     cg.add(var.set_enable_uvc(config[CONF_ENABLE_UVC]))
+    cg.add(var.set_buffer_count(config[CONF_BUFFER_COUNT]))
 
     cg.add(var.set_device(config[CONF_DEVICE]))
     cg.add(var.set_resolution(config[CONF_RESOLUTION]))
