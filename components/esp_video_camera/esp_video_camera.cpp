@@ -511,7 +511,8 @@ void ESPVideoCamera::loop() {
 void ESPVideoCamera::queue_frame_(const uint8_t *data, size_t length) {
   if (length == 0)
     return;
-  if (!this->hardware_framerate_active_.load(std::memory_order_acquire)) {
+  if (!this->jpeg_admission_active_ &&
+      !this->hardware_framerate_active_.load(std::memory_order_acquire)) {
     const uint32_t now = millis();
     const uint32_t min_interval =
         this->min_interval_ms_.load(std::memory_order_acquire);
@@ -737,6 +738,9 @@ void ESPVideoCamera::loop_direct_capture_() {
 void ESPVideoCamera::loop_jpeg_pipeline_() {
   // Dequeue one RGB565 frame from the sensor/ISP device. This task blocks on
   // the driver's frame queue and wakes only when a frame is ready.
+#ifdef USE_ESPHOME_VOIP_STACK_VIDEO_DEBUG
+  const uint32_t dq_started_us = micros();
+#endif
   struct v4l2_buffer cap_buf;
   memset(&cap_buf, 0, sizeof(cap_buf));
   cap_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -749,6 +753,35 @@ void ESPVideoCamera::loop_jpeg_pipeline_() {
     this->capture_wanted_.store(false, std::memory_order_release);
     return;
   }
+
+#ifdef USE_ESPHOME_VOIP_STACK_VIDEO_DEBUG
+  const bool debug_jpeg =
+      this->jpeg_frame_consumer_active_.load(std::memory_order_acquire);
+  const uint32_t debug_generation =
+      this->jpeg_debug_generation_.load(std::memory_order_acquire);
+  if (debug_jpeg &&
+      debug_generation != this->jpeg_debug_observed_generation_) {
+    this->jpeg_debug_observed_generation_ = debug_generation;
+    this->jpeg_debug_frames_ = 0;
+    this->jpeg_debug_dqbuf_ = 0;
+    this->jpeg_debug_admitted_ = 0;
+    this->jpeg_debug_cadence_skipped_ = 0;
+    this->jpeg_debug_dq_wait_total_us_ = 0;
+    this->jpeg_debug_dq_wait_max_us_ = 0;
+    this->jpeg_debug_ppa_total_us_ = 0;
+    this->jpeg_debug_encode_total_us_ = 0;
+    this->jpeg_debug_ppa_max_us_ = 0;
+    this->jpeg_debug_encode_max_us_ = 0;
+    this->jpeg_debug_last_log_ms_ = millis();
+  }
+  if (debug_jpeg) {
+    const uint32_t waited_us = micros() - dq_started_us;
+    this->jpeg_debug_dqbuf_++;
+    this->jpeg_debug_dq_wait_total_us_ += waited_us;
+    this->jpeg_debug_dq_wait_max_us_ =
+        std::max(this->jpeg_debug_dq_wait_max_us_, waited_us);
+  }
+#endif
 
   bool raw_requeued = false;
   auto requeue_raw = [&]() -> bool {
@@ -792,9 +825,27 @@ void ESPVideoCamera::loop_jpeg_pipeline_() {
   // no reason to rotate, encode, copy or wake the ESPHome loop without a
   // consumer. Requeue this naturally delivered frame immediately.
   if (!this->has_consumers_()) {
+    this->frame_cadence_.reset();
     requeue_raw();
     return;
   }
+
+  // On HW JPEG the camera owns one admission decision for every consumer.
+  // Reject before a raw callback, PPA or JPEG can borrow this MMAP buffer.
+  if (this->jpeg_admission_active_ &&
+      !this->frame_cadence_.accept(
+          micros(), this->max_framerate_.load(std::memory_order_acquire))) {
+#ifdef USE_ESPHOME_VOIP_STACK_VIDEO_DEBUG
+    if (debug_jpeg)
+      this->jpeg_debug_cadence_skipped_++;
+#endif
+    requeue_raw();
+    return;
+  }
+#ifdef USE_ESPHOME_VOIP_STACK_VIDEO_DEBUG
+  if (debug_jpeg)
+    this->jpeg_debug_admitted_++;
+#endif
 
   const auto &raw_buffer = this->capture_buffers_[cap_buf.index];
   const bool raw_warming_up =
@@ -828,23 +879,6 @@ void ESPVideoCamera::loop_jpeg_pipeline_() {
     requeue_raw();
     return;
   }
-
-#ifdef USE_ESPHOME_VOIP_STACK_VIDEO_DEBUG
-  const bool debug_jpeg =
-      this->jpeg_frame_consumer_active_.load(std::memory_order_acquire);
-  const uint32_t debug_generation =
-      this->jpeg_debug_generation_.load(std::memory_order_acquire);
-  if (debug_jpeg &&
-      debug_generation != this->jpeg_debug_observed_generation_) {
-    this->jpeg_debug_observed_generation_ = debug_generation;
-    this->jpeg_debug_frames_ = 0;
-    this->jpeg_debug_ppa_total_us_ = 0;
-    this->jpeg_debug_encode_total_us_ = 0;
-    this->jpeg_debug_ppa_max_us_ = 0;
-    this->jpeg_debug_encode_max_us_ = 0;
-    this->jpeg_debug_last_log_ms_ = millis();
-  }
-#endif
 
   const uint8_t *jpeg_input =
       static_cast<const uint8_t *>(raw_buffer.start);
@@ -974,14 +1008,21 @@ void ESPVideoCamera::loop_jpeg_pipeline_() {
       ESP_LOGI(
           TAG,
           "Camera JPEG hardware: frames=%u ppa_avg=%uus ppa_max=%uus "
-          "encode_avg=%uus encode_max=%uus",
+          "encode_avg=%uus encode_max=%uus dq=%u admitted=%u "
+          "cadence_skipped=%u dq_wait_avg=%uus dq_wait_max=%uus",
           (unsigned) this->jpeg_debug_frames_,
           (unsigned) (this->jpeg_debug_ppa_total_us_ /
                       std::max<uint32_t>(1, this->jpeg_debug_frames_)),
           (unsigned) this->jpeg_debug_ppa_max_us_,
           (unsigned) (this->jpeg_debug_encode_total_us_ /
                       std::max<uint32_t>(1, this->jpeg_debug_frames_)),
-          (unsigned) this->jpeg_debug_encode_max_us_);
+          (unsigned) this->jpeg_debug_encode_max_us_,
+          (unsigned) this->jpeg_debug_dqbuf_,
+          (unsigned) this->jpeg_debug_admitted_,
+          (unsigned) this->jpeg_debug_cadence_skipped_,
+          (unsigned) (this->jpeg_debug_dq_wait_total_us_ /
+                      std::max<uint32_t>(1, this->jpeg_debug_dqbuf_)),
+          (unsigned) this->jpeg_debug_dq_wait_max_us_);
     }
   }
 #endif
@@ -1263,6 +1304,9 @@ bool ESPVideoCamera::configure_capture_format_(uint32_t pixelformat) {
 }
 
 bool ESPVideoCamera::configure_capture_framerate_() {
+  // Admission belongs to the HW JPEG device even if rate negotiation fails.
+  // Every consumer still shares max_framerate when V4L2 cannot enforce it.
+  this->jpeg_admission_active_ = this->is_hw_jpeg_ && !this->is_raw_csi_;
   struct v4l2_streamparm parm {};
   parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   if (ioctl(this->capture_fd_, VIDIOC_G_PARM, &parm) < 0) {
@@ -1284,20 +1328,24 @@ bool ESPVideoCamera::configure_capture_framerate_() {
   }
   const uint32_t source_fps = this->native_capture_fps_;
 
-  uint32_t target_fps = static_cast<uint32_t>(
-      std::floor(this->max_framerate_.load(std::memory_order_acquire)));
-  target_fps = std::clamp<uint32_t>(target_fps, 1, source_fps);
-  while (target_fps > 1 && source_fps % target_fps != 0)
-    target_fps--;
+  const bool native_jpeg_clock = this->jpeg_admission_active_;
+  uint32_t target_fps = source_fps;
+  if (!native_jpeg_clock) {
+    target_fps = static_cast<uint32_t>(
+        std::floor(this->max_framerate_.load(std::memory_order_acquire)));
+    target_fps = std::clamp<uint32_t>(target_fps, 1, source_fps);
+    while (target_fps > 1 && source_fps % target_fps != 0)
+      target_fps--;
+  }
 
   if (target_fps == reported_fps) {
     ESP_LOGI(TAG, "Capture framerate: %u fps", (unsigned) reported_fps);
     return true;
   }
 
-  // esp_video's CSI implementation requires numerator=1 and an integer divisor
-  // of the sensor rate. It then skips frames in the ISR, so DQBUF remains
-  // event-driven and PPA/JPEG only process frames that can actually be used.
+  // esp_video's divisor advances only while capture buffers are available.
+  // HW JPEG therefore keeps the native clock and admits before processing.
+  // Dedicated raw CSI retains its existing integer device-rate policy.
   capture.timeperframe.numerator = 1;
   capture.timeperframe.denominator = target_fps;
   if (ioctl(this->capture_fd_, VIDIOC_S_PARM, &parm) < 0) {
@@ -1316,8 +1364,10 @@ bool ESPVideoCamera::configure_capture_framerate_() {
     ESP_LOGI(TAG, "Capture framerate: %u fps (source %u fps)",
              (unsigned) actual_fps,
              (unsigned) source_fps);
-    if (actual_fps <= target_fps)
+    if (actual_fps <= target_fps &&
+        (!native_jpeg_clock || actual_fps == source_fps)) {
       return true;
+    }
   }
   ESP_LOGW(TAG, "capture framerate could not be confirmed; using software throttle");
   return false;
@@ -1547,6 +1597,7 @@ bool ESPVideoCamera::start_capture_() {
     if (this->is_hw_jpeg_)
       this->startup_frames_remaining_ = STARTUP_FRAME_COUNT;
     this->last_frame_ms_ = 0;
+    this->frame_cadence_.reset();
     return true;
   }
   if (this->capture_fd_ >= 0 || this->jpeg_fd_ >= 0 ||
@@ -1574,6 +1625,7 @@ bool ESPVideoCamera::start_capture_() {
   if (this->is_hw_jpeg_)
     this->startup_frames_remaining_ = STARTUP_FRAME_COUNT;
   this->last_frame_ms_ = 0;
+  this->frame_cadence_.reset();
   return true;
 }
 

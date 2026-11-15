@@ -207,7 +207,7 @@ esp_video_camera:
 | `resolution` | `auto` | `auto`, an alias (`QVGA`/`VGA`/`480P`/`720P`/`1080P`) or `WIDTHxHEIGHT`. Best-effort: the sensor must actually support the mode, see "Sensor modes". |
 | `jpeg_quality` | `10` | 1..63 (`V4L2_CID_JPEG_COMPRESSION_QUALITY`). |
 | `rotation` | `0` | `0`, `90`, `180` or `270` degrees clockwise. Hardware PPA; MIPI-CSI JPEG path only. |
-| `max_framerate` | `10` | Programs V4L2 frame skipping when supported. If the source cannot apply it, ESPHome API frames use a software throttle while borrowed consumers retain the sensor frame rate. |
+| `max_framerate` | `10` | Hardware-JPEG devices share admission before raw callbacks, PPA and JPEG processing. Other paths retain device frame skipping or the existing API throttle. |
 | `buffer_count` | `3` | Number of queued V4L2 capture buffers. Use `2` to reduce capture memory while retaining double buffering. |
 | `enable_xclk` | `false` | Generate the sensor XCLK with LEDC before init. Not needed for modules with their own crystal. |
 | `xclk_pin` | `36` | Only used when `enable_xclk: true`. |
@@ -380,6 +380,19 @@ that in-flight callback has returned.
 consumers receive every sensor frame. A JPEG consumer therefore keeps the
 hardware encoder running at the sensor rate even when no Home Assistant camera
 listener is active.
+
+Hardware-JPEG devices use one capture-task-owned admission cadence before raw
+callbacks, PPA rotation and JPEG encoding. The V4L2 input keeps its native rate
+when available. Rejected frames return directly to capture without rotation,
+encoding or an image copy. Borrowed consumers and the ESPHome camera API share
+that decision; fractional frame rates retain phase without a catch-up burst
+after a pause.
+
+This adds scalar cadence state, not another image buffer, task or mutex.
+The capture source can still run faster than `max_framerate`; skipped frames
+are not processed by PPA/JPEG. Dedicated raw CSI and direct JPEG/MJPEG retain
+their existing device-rate and API-throttle behavior. If native rate negotiation
+fails, hardware-JPEG consumers still share the available input admission cap.
 
 Registration and activation are separate: register a stable consumer object
 once, then use `start_raw_frame_consumer()` / `stop_raw_frame_consumer()` or

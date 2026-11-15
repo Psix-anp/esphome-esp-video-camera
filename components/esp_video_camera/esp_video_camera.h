@@ -10,6 +10,7 @@
 
 #include "driver/gpio.h"
 #include "driver/ppa.h"
+#include "frame_cadence.h"
 
 #include <atomic>
 #include <memory>
@@ -169,9 +170,8 @@ class ESPVideoCamera : public camera::Camera {
     this->min_interval_ms_.store(
         (fps > 0.0f) ? (uint32_t) (1000.0f / fps) : 0,
         std::memory_order_release);
-    // Runtime changes cannot reprogram an already-streaming CSI device here.
-    // Use the frame-driven gate for the current session; resume_capture_()
-    // reapplies S_PARM before the next STREAMON without reallocating buffers.
+    // Capture-task admission observes this value on the next frame. Legacy
+    // device-limited paths use the API fallback until the next STREAMON.
     this->hardware_framerate_active_.store(false,
                                            std::memory_order_release);
   }
@@ -254,6 +254,9 @@ class ESPVideoCamera : public camera::Camera {
   uint32_t native_capture_fps_{0};
   uint32_t last_frame_ms_{0};
   std::atomic<bool> hardware_framerate_active_{false};
+  // Only the capture task selects and advances this admission policy.
+  bool jpeg_admission_active_{false};
+  FrameCadence frame_cadence_{};
 
   // Consumers (bit masks indexed by camera::CameraRequester)
   std::vector<camera::CameraListener *> listeners_;
@@ -274,6 +277,11 @@ class ESPVideoCamera : public camera::Camera {
   std::atomic<uint32_t> jpeg_debug_generation_{0};
   uint32_t jpeg_debug_observed_generation_{0};
   uint32_t jpeg_debug_frames_{0};
+  uint32_t jpeg_debug_dqbuf_{0};
+  uint32_t jpeg_debug_admitted_{0};
+  uint32_t jpeg_debug_cadence_skipped_{0};
+  uint64_t jpeg_debug_dq_wait_total_us_{0};
+  uint32_t jpeg_debug_dq_wait_max_us_{0};
   uint64_t jpeg_debug_ppa_total_us_{0};
   uint64_t jpeg_debug_encode_total_us_{0};
   uint32_t jpeg_debug_ppa_max_us_{0};
