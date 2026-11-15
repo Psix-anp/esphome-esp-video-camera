@@ -5,6 +5,22 @@ to this repository, not to the upstream pull request.
 
 ## Unreleased
 
+### Shared hardware-JPEG frame cadence
+
+* Admit hardware-JPEG frames once, on the existing capture task, before raw
+  callbacks, PPA rotation and hardware JPEG encoding. Every consumer, including
+  the ESPHome camera API, uses that decision without a second throttle.
+* Keep the native V4L2 capture rate for this path and apply the requested
+  `max_framerate` at admission. Fractional rates, timestamp wrap, runtime rate
+  changes and resuming after a pause retain a bounded phase without catch-up
+  bursts. Failed rate negotiation still leaves the shared admission cap active.
+* Preserve dedicated raw CSI and direct JPEG/MJPEG behavior. The change adds
+  scalar cadence state and optional debug counters, with no additional image
+  buffer, task, mutex or per-rejected-frame copy.
+* Host tests exercise production methods with controlled V4L2/PPA behavior,
+  including buffer ownership and failure paths under ASan/UBSan. This records
+  software behavior, not a measured hardware FPS or CPU improvement.
+
 ### Added
 
 * Synchronous borrowed-frame consumers for native RGB565 CSI frames and encoded
@@ -30,8 +46,9 @@ to this repository, not to the upstream pull request.
 * Hardware JPEG warmup discards the first two CSI buffers after `STREAMON`;
   raw CSI retains a 250 ms deadline. Linger and recovery use one-shot ESPHome
   timers.
-* `max_framerate` uses `VIDIOC_S_PARM` hardware frame skipping when supported,
-  with the existing software throttle retained as a fallback.
+* Dedicated raw CSI uses `VIDIOC_S_PARM` hardware frame skipping when
+  supported. Hardware-JPEG devices use the shared admission cadence described
+  above; direct JPEG/MJPEG retains the existing API throttle.
 * Per-frame ISP/IPA debug telemetry is clamped to warnings through ESP-IDF's
   linked-list tag-level filter.
 
