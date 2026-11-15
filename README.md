@@ -376,11 +376,6 @@ callback delivery but do not wait for a callback already running on the capture
 task. The consumer object and any callback-owned state must remain valid until
 that in-flight callback has returned.
 
-`max_framerate` throttles only frames copied to the ESPHome camera API. Borrowed
-consumers receive every sensor frame. A JPEG consumer therefore keeps the
-hardware encoder running at the sensor rate even when no Home Assistant camera
-listener is active.
-
 Hardware-JPEG devices use one capture-task-owned admission cadence before raw
 callbacks, PPA rotation and JPEG encoding. The V4L2 input keeps its native rate
 when available. Rejected frames return directly to capture without rotation,

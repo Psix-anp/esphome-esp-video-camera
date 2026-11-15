@@ -46,8 +46,9 @@ to this repository, not to the upstream pull request.
 * Hardware JPEG warmup discards the first two CSI buffers after `STREAMON`;
   raw CSI retains a 250 ms deadline. Linger and recovery use one-shot ESPHome
   timers.
-* `max_framerate` uses `VIDIOC_S_PARM` hardware frame skipping when supported,
-  with the existing software throttle retained as a fallback.
+* Dedicated raw CSI uses `VIDIOC_S_PARM` hardware frame skipping when
+  supported. Hardware-JPEG devices use the shared admission cadence described
+  above; direct JPEG/MJPEG retains the existing API throttle.
 * Per-frame ISP/IPA debug telemetry is clamped to warnings through ESP-IDF's
   linked-list tag-level filter.
 
